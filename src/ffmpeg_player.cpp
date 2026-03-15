@@ -186,7 +186,12 @@ bool FFmpegPlayer::load_video(const String &path) {
                ? (double)fmt_ctx->duration / AV_TIME_BASE
                : 0.0;
 
-    current_texture.instantiate();
+    // إنشاء ImageTexture فارغ أولي لتجنب crash عند التحديث
+Ref<Image> img;
+img.instantiate();
+img->create(video_width, video_height, false, Image::FORMAT_RGB8, PackedByteArray());
+current_texture.instantiate();
+current_texture->create_from_image(img);
     position = 0.0;
 
     emit_signal("video_loaded", true);
