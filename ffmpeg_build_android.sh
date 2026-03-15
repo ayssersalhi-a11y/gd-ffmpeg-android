@@ -1,54 +1,57 @@
 #!/bin/bash
 # ffmpeg_build_android.sh
+# يعمل محلياً وفي GitHub Actions
 # ─────────────────────────────────────────────────────────────────────────────
-# بناء FFmpeg مُجمَّع ثابتاً (static) لنظام Android
-# المخرج: مجلد ffmpeg-android/ يحتوي على:
-#   arm64-v8a/include/  ← ملفات الهيدر
-#   arm64-v8a/lib/      ← libavcodec.a, libavformat.a, ...
-#   armeabi-v7a/...     (اختياري)
-# ─────────────────────────────────────────────────────────────────────────────
-
 set -e
 
-# ── الإعدادات ─────────────────────────────────────────────────────────────────
-NDK_PATH="${HOME}/android-ndk-r26c"       # عدّل هذا
-FFMPEG_VERSION="7.0"
-FFMPEG_SRC="./ffmpeg-${FFMPEG_VERSION}"
-OUTPUT_DIR="./ffmpeg-android"
-API_LEVEL=24                               # Android 7+
+# ── الإعدادات: تأتي من متغيرات البيئة أو القيم الافتراضية ───────────────────
+NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
+FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/ffmpeg-android}"
+API_LEVEL="${API_LEVEL:-24}"
 
-# ── تحميل FFmpeg ──────────────────────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════════════╗"
+echo "║  بناء FFmpeg ${FFMPEG_VERSION} لـ Android (arm64-v8a)  ║"
+echo "╚══════════════════════════════════════════════╝"
+echo "  NDK_PATH   : ${NDK_PATH}"
+echo "  OUTPUT_DIR : ${OUTPUT_DIR}"
+echo "  API Level  : ${API_LEVEL}"
+echo ""
+
+# ── تحميل FFmpeg إذا لم يوجد ─────────────────────────────────────────────────
+FFMPEG_SRC="ffmpeg-${FFMPEG_VERSION}"
 if [ ! -d "${FFMPEG_SRC}" ]; then
     echo "── تحميل FFmpeg ${FFMPEG_VERSION} ──"
-    wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz"
+    wget -q --show-progress \
+        "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" \
+        -O "ffmpeg-${FFMPEG_VERSION}.tar.gz"
     tar xzf "ffmpeg-${FFMPEG_VERSION}.tar.gz"
+    rm "ffmpeg-${FFMPEG_VERSION}.tar.gz"
 fi
 
-# ── دالة البناء لكل ABI ───────────────────────────────────────────────────────
-build_ffmpeg() {
+# ── دالة البناء ───────────────────────────────────────────────────────────────
+build_abi() {
     local ABI="$1"
     local ARCH="$2"
     local CPU="$3"
-    local CROSS_PREFIX="$4"
-
-    echo ""
-    echo "══ بناء FFmpeg لـ ${ABI} ══"
+    local CROSS_PREFIX_BIN="$4"
 
     local PREFIX="${OUTPUT_DIR}/${ABI}"
     mkdir -p "${PREFIX}"
 
+    echo "══ بناء FFmpeg لـ ${ABI} ══"
+
     local TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
     local SYSROOT="${TOOLCHAIN}/sysroot"
 
-    # تصدير متغيرات المترجم
-    export CC="${TOOLCHAIN}/bin/${CROSS_PREFIX}${API_LEVEL}-clang"
-    export CXX="${TOOLCHAIN}/bin/${CROSS_PREFIX}${API_LEVEL}-clang++"
+    export CC="${TOOLCHAIN}/bin/${CROSS_PREFIX_BIN}${API_LEVEL}-clang"
+    export CXX="${TOOLCHAIN}/bin/${CROSS_PREFIX_BIN}${API_LEVEL}-clang++"
     export AR="${TOOLCHAIN}/bin/llvm-ar"
     export AS="${CC}"
     export NM="${TOOLCHAIN}/bin/llvm-nm"
     export STRIP="${TOOLCHAIN}/bin/llvm-strip"
     export RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
-    export LD="${TOOLCHAIN}/bin/ld"
 
     cd "${FFMPEG_SRC}"
 
@@ -58,7 +61,6 @@ build_ffmpeg() {
         --arch="${ARCH}" \
         --cpu="${CPU}" \
         --enable-cross-compile \
-        --cross-prefix="${TOOLCHAIN}/bin/llvm-" \
         --sysroot="${SYSROOT}" \
         --cc="${CC}" \
         --cxx="${CXX}" \
@@ -67,43 +69,42 @@ build_ffmpeg() {
         --ranlib="${RANLIB}" \
         --strip="${STRIP}" \
         \
-        --enable-static          \
-        --disable-shared         \
-        --disable-programs       \
-        --disable-doc            \
-        --disable-debug          \
+        --enable-static \
+        --disable-shared \
+        --disable-programs \
+        --disable-doc \
+        --disable-debug \
+        --disable-everything \
         \
-        --enable-avcodec         \
-        --enable-avformat        \
-        --enable-avutil          \
-        --enable-swscale         \
-        --enable-swresample      \
+        --enable-avcodec \
+        --enable-avformat \
+        --enable-avutil \
+        --enable-swscale \
+        --enable-swresample \
         \
-        --enable-decoder=h264    \
-        --enable-decoder=hevc    \
-        --enable-decoder=vp8     \
-        --enable-decoder=vp9     \
-        --enable-decoder=av1     \
-        --enable-decoder=mpeg4   \
-        --enable-decoder=aac     \
-        --enable-decoder=mp3     \
-        --enable-decoder=ac3     \
-        --enable-decoder=flac    \
-        --enable-decoder=opus    \
+        --enable-decoder=h264 \
+        --enable-decoder=hevc \
+        --enable-decoder=vp8 \
+        --enable-decoder=vp9 \
+        --enable-decoder=av1 \
+        --enable-decoder=mpeg4 \
+        --enable-decoder=aac \
+        --enable-decoder=mp3 \
+        --enable-decoder=opus \
+        --enable-decoder=flac \
+        --enable-decoder=ac3 \
         \
-        --enable-demuxer=mp4     \
+        --enable-demuxer=mp4 \
         --enable-demuxer=matroska \
-        --enable-demuxer=avi     \
-        --enable-demuxer=mov     \
+        --enable-demuxer=mov \
+        --enable-demuxer=avi \
         \
-        --enable-parser=h264     \
-        --enable-parser=hevc     \
-        --enable-parser=aac      \
+        --enable-parser=h264 \
+        --enable-parser=hevc \
+        --enable-parser=aac \
         \
-        --enable-protocol=file   \
-        --enable-protocol=pipe   \
-        \
-        --disable-everything-else-not-listed-above \
+        --enable-protocol=file \
+        --enable-protocol=pipe \
         \
         --extra-cflags="-Os -fPIC -fvisibility=hidden" \
         --extra-ldflags="-Wl,--gc-sections"
@@ -113,15 +114,13 @@ build_ffmpeg() {
     make clean
 
     cd ..
-    echo "✓ ${ABI}: مكتمل في ${PREFIX}"
+    echo "✓ ${ABI} → ${PREFIX}"
 }
 
-# ── بناء arm64-v8a ────────────────────────────────────────────────────────────
-build_ffmpeg "arm64-v8a"   "aarch64" "armv8-a" "aarch64-linux-android"
-
-# ── بناء armeabi-v7a (اختياري، أجهزة قديمة) ─────────────────────────────────
-# build_ffmpeg "armeabi-v7a" "arm"     "armv7-a" "armv7a-linux-androideabi"
+# ── التنفيذ ───────────────────────────────────────────────────────────────────
+build_abi "arm64-v8a" "aarch64" "armv8-a" "aarch64-linux-android"
+# build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
 
 echo ""
-echo "✓ FFmpeg لـ Android جاهز في: ${OUTPUT_DIR}/"
-echo "  استخدم مسار هذا المجلد في FFMPEG_DIR بسكريبت البناء الرئيسي"
+echo "✓ FFmpeg جاهز في: ${OUTPUT_DIR}/"
+ls -lh "${OUTPUT_DIR}/arm64-v8a/lib/"
