@@ -119,7 +119,7 @@ build_abi() {
 
 # ── التنفيذ ───────────────────────────────────────────────────────────────────
 build_abi "arm64-v8a" "aarch64" "armv8-a" "aarch64-linux-android"
-# build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
+build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
 
 echo ""
 echo "✓ FFmpeg جاهز في: ${OUTPUT_DIR}/"
