@@ -1,1 +1,166 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  GitHub Actions — بناء libgdffmpeg.so لـ Android                    ║
+# ║  المخرج: libgdffmpeg.android.arm64.so  (~5-15 MB)                   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# هيكل الريبو المطلوب:
+#   your-repo/
+#   ├── .github/workflows/build.yml   ← هذا الملف
+#   ├── src/
+#   │   └── ffmpeg_player.cpp
+#   ├── include/
+#   │   └── ffmpeg_player.h
+#   ├── CMakeLists.txt
+#   ├── ffmpeg_build_android.sh
+#   └── gdffmpeg.gdextension
 
+name: Build libgdffmpeg.so for Android
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:          # تشغيل يدوي من صفحة Actions
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90       # FFmpeg يحتاج وقتاً للبناء
+
+    env:
+      NDK_VERSION:        r26c
+      GODOT_CPP_BRANCH:   godot-4.3-stable
+      FFMPEG_VERSION:     "7.0"
+      ANDROID_API:        "24"
+
+    steps:
+      # ── 1. استنساخ الريبو ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. تثبيت Android NDK ─────────────────────────────────────────
+      - name: Setup Android NDK ${{ env.NDK_VERSION }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      # ── 3. تثبيت أدوات البناء ────────────────────────────────────────
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build \
+            nasm yasm \
+            python3 git \
+            pkg-config
+
+      # ── 4. كاش godot-cpp (تسريع الإعادة) ────────────────────────────
+      - name: Cache godot-cpp
+        uses: actions/cache@v4
+        id: cache-godotcpp
+        with:
+          path: godot-cpp
+          key: godot-cpp-${{ env.GODOT_CPP_BRANCH }}
+
+      - name: Clone godot-cpp
+        if: steps.cache-godotcpp.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive \
+            https://github.com/godotengine/godot-cpp.git \
+            --branch ${{ env.GODOT_CPP_BRANCH }} \
+            --depth 1 \
+            godot-cpp
+
+      # ── 5. كاش FFmpeg (يوفر ~30 دقيقة عند الإعادة) ──────────────────
+      - name: Cache FFmpeg Android libraries
+        uses: actions/cache@v4
+        id: cache-ffmpeg
+        with:
+          path: ffmpeg-android
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-android-api${{ env.ANDROID_API }}-ndk${{ env.NDK_VERSION }}
+
+      # ── 6. بناء FFmpeg (فقط إذا لم يوجد في الكاش) ───────────────────
+      - name: Build FFmpeg for Android arm64-v8a
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+          OUTPUT_DIR: ${{ github.workspace }}/ffmpeg-android
+          FFMPEG_VERSION: ${{ env.FFMPEG_VERSION }}
+          API_LEVEL: ${{ env.ANDROID_API }}
+        run: |
+          chmod +x ffmpeg_build_android.sh
+          ./ffmpeg_build_android.sh
+
+      # ── 7. بناء libgdffmpeg.so — ARM 64-bit ──────────────────────────
+      - name: Build libgdffmpeg.so (arm64-v8a)
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cmake -S . -B build/arm64 \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${{ env.ANDROID_API }} \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
+            -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg-android" \
+            -DCMAKE_VERBOSE_MAKEFILE=OFF
+
+          cmake --build build/arm64 --parallel $(nproc)
+
+      # ── 8. بناء libgdffmpeg.so — ARM 32-bit (اختياري) ───────────────
+      - name: Build libgdffmpeg.so (armeabi-v7a)
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cmake -S . -B build/arm32 \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-${{ env.ANDROID_API }} \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGODOT_CPP_DIR="${{ github.workspace }}/godot-cpp" \
+            -DFFMPEG_DIR="${{ github.workspace }}/ffmpeg-android" \
+            -DCMAKE_VERBOSE_MAKEFILE=OFF
+
+          cmake --build build/arm32 --parallel $(nproc)
+
+      # ── 9. تجميع الملفات المُخرجة ─────────────────────────────────────
+      - name: Collect output files
+        run: |
+          mkdir -p dist/addons/gdffmpeg/bin
+
+          # ملفات .so
+          cp build/arm64/libgdffmpeg.android.arm64.so dist/addons/gdffmpeg/bin/ 2>/dev/null || true
+          cp build/arm32/libgdffmpeg.android.arm32.so dist/addons/gdffmpeg/bin/ 2>/dev/null || true
+
+          # ملف .gdextension
+          cp gdffmpeg.gdextension dist/addons/gdffmpeg/ 2>/dev/null || true
+
+          echo "══ الملفات المُجمَّعة ══"
+          ls -lh dist/addons/gdffmpeg/bin/
+
+      # ── 10. رفع الملفات كـ Artifact ──────────────────────────────────
+      - name: Upload compiled .so files
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgdffmpeg-android-${{ github.ref_name }}-${{ github.run_number }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 11. ملخص نهائي ────────────────────────────────────────────────
+      - name: Build summary
+        run: |
+          echo "## ✅ البناء مكتمل" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| الملف | الحجم |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/addons/gdffmpeg/bin/*.so; do
+            name=$(basename $f)
+            size=$(du -h $f | cut -f1)
+            echo "| \`$name\` | $size |" >> $GITHUB_STEP_SUMMARY
+          done
