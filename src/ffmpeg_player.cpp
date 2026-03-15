@@ -258,12 +258,18 @@ void FFmpegPlayer::_decode_next_frame() {
                     int sz = video_width * video_height * 3;
                     pba.resize(sz);
                     memcpy(pba.ptrw(), frame_buffer, sz);
-
                     Ref<Image> img = Image::create_from_data(
                         video_width, video_height, false,
                         Image::FORMAT_RGB8, pba
                     );
-                    current_texture->update(img);
+
+                     // إنشاء الـ Texture أول مرة
+                    if (!current_texture.is_valid()) {
+                        current_texture = ImageTexture::create_from_image(img);
+                    } else {
+                        current_texture->update(img);
+                    }
+
                     emit_signal("frame_updated", current_texture);
 
                     got_frame = true;
