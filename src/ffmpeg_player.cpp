@@ -28,7 +28,7 @@ extern "C" {
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
-#include <godot_cpp/classes/audio_stream_wav.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
 
 using namespace godot;
 
@@ -186,7 +186,7 @@ bool FFmpegPlayer::load_video(const String &path) {
                ? (double)fmt_ctx->duration / AV_TIME_BASE
                : 0.0;
 
-    current_texture = ImageTexture::create();
+    current_texture.instantiate();
     position = 0.0;
 
     emit_signal("video_loaded", true);
