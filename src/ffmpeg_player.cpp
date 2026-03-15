@@ -268,8 +268,10 @@ void FFmpegPlayer::_decode_next_frame() {
                         video_width, video_height, false,
                         Image::FORMAT_RGB8, pba
                     );
-                    current_texture->update(img);
-                    emit_signal("frame_updated", current_texture);
+                    if (!current_texture.is_null()) {
+    current_texture->set_data(img);
+    emit_signal("frame_updated", current_texture);
+}
 
                     got_frame = true;
                     break;
