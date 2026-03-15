@@ -122,5 +122,8 @@ build_abi "arm64-v8a" "aarch64" "armv8-a" "aarch64-linux-android"
 build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
 
 echo ""
-echo "✓ FFmpeg جاهز في: ${OUTPUT_DIR}/"
+echo "✓ FFmpeg 64-bit: ${OUTPUT_DIR}/arm64-v8a/lib/"
 ls -lh "${OUTPUT_DIR}/arm64-v8a/lib/"
+
+echo "✓ FFmpeg 32-bit: ${OUTPUT_DIR}/armeabi-v7a/lib/"
+ls -lh "${OUTPUT_DIR}/armeabi-v7a/lib/"
