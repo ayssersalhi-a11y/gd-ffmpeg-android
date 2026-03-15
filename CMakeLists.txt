@@ -109,7 +109,7 @@ endif()
 # ─── رسالة ما بعد البناء ─────────────────────────────────────────────────────
 add_custom_command(TARGET gdffmpeg POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo
-        "✓ تم البناء: $<TARGET_FILE:gdffmpeg>"
+        "Build successful: $<TARGET_FILE:gdffmpeg>"
     COMMAND ${CMAKE_COMMAND} -E echo
-        "  انسخ هذا الملف إلى: <مشروع Godot>/addons/gdffmpeg/bin/"
+        "Copy this file to: YOUR_GODOT_PROJECT/addons/gdffmpeg/bin/"
 )
