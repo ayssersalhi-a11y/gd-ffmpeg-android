@@ -1,6 +1,7 @@
 /**
  * ffmpeg_player.h
  * تعريف كلاس FFmpegPlayer - GDExtension لـ Godot 4
+ * نسخة معدلة لتوافق التعديلات الأخيرة على الـ CPP
  */
 
 #pragma once
@@ -18,18 +19,6 @@ extern "C" {
 
 namespace godot {
 
-/**
- * FFmpegPlayer
- * ────────────
- * Node يُضاف لمشهد Godot ويتحكم في تشغيل الفيديو عبر FFmpeg.
- * يُصدر كل إطار كـ ImageTexture يمكن عرضها على TextureRect.
- *
- * الاستخدام في GDScript:
- *   var player = FFmpegPlayer.new()
- *   add_child(player)
- *   player.load_video("res://videos/sample.mp4")
- *   player.play()
- */
 class FFmpegPlayer : public Node {
     GDCLASS(FFmpegPlayer, Node)
 
@@ -39,22 +28,24 @@ public:
 
     // ── واجهة GDScript ──────────────────────────────────────────────────────
     bool load_video(const String &path);
+
     void play();
     void pause();
     void stop();
     void seek(double seconds);
 
-    bool   is_playing()              const;
-    double get_duration()            const;
-    double get_position()            const;
-    int    get_video_width()         const;
-    int    get_video_height()        const;
-    double get_fps()                 const;
+    bool   is_playing() const;
+    double get_duration() const;
+    double get_position() const;
+    int    get_video_width() const;
+    int    get_video_height() const;
+    double get_fps() const;
     Ref<ImageTexture> get_current_frame_texture() const;
 
-    void  set_loop(bool enable);
-    bool  get_loop() const;
-    void  set_volume(float vol);
+    void set_loop(bool en);
+    bool get_loop() const;
+
+    void set_volume(float v);
     float get_volume() const;
 
     // ── Override Godot ───────────────────────────────────────────────────────
@@ -75,21 +66,22 @@ private:
     int audio_stream_idx;
 
     // حالة التشغيل
-    bool   playing;
-    bool   looping;
-    float  volume;
+    bool playing;
+    bool looping;
+    float volume;
     double duration;
     double position;
 
     // معلومات الفيديو
-    int    video_width;
-    int    video_height;
+    int video_width;
+    int video_height;
     double fps;
 
     // مخزن الإطار الحالي
     uint8_t          *frame_buffer;
-    Ref<ImageTexture>  current_texture;
+    Ref<ImageTexture> current_texture;
 
+    // ── دوال داخلية ─────────────────────────────────────────────────────────
     void _decode_next_frame();
     void _cleanup();
 };
