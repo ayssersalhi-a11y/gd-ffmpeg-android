@@ -72,7 +72,6 @@ void FFmpegPlayer::_bind_methods() {
 
 // ─── البنّاء والهادم ──────────────────────────────────────────────────────────
 FFmpegPlayer::FFmpegPlayer()
-FFmpegPlayer::FFmpegPlayer()
     : fmt_ctx(nullptr),
       video_codec_ctx(nullptr),
       audio_codec_ctx(nullptr),
