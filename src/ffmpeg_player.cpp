@@ -349,15 +349,25 @@ void FFmpegPlayer::_decode_next_frame() {
 
     bool got_video = false;
     int  attempts = 0;
-    const int MAX_ATTEMPTS = 500; // محاولات أكثر لضمان عدم توقف البلاي فجأة
+    const int MAX_ATTEMPTS = 800; // رفعنا المحاولات لضمان تجاوز فجوات البيانات
 
-    while (!got_video && attempts < MAX_ATTEMPTS && av_read_frame(fmt_ctx, packet) >= 0) {
+    while (!got_video && attempts < MAX_ATTEMPTS) {
+        int ret = av_read_frame(fmt_ctx, packet);
+        
+        if (ret < 0) {
+            // إذا وصلنا لنهاية الملف الحقيقية
+            if (ret == AVERROR_EOF) {
+                if (looping) seek(0.0);
+                else playing = false;
+            }
+            break; 
+        }
+
         attempts++;
 
-        // معالجة الفيديو
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
-                if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                     sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
 
@@ -368,6 +378,7 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
+                    // التأكد من تهيئة التكستشر في Godot
                     if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
@@ -376,11 +387,11 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     _emit_frame_updated();
                     got_video = true;
+                    break; // خرجنا بإطار فيديو ناجح
                 }
             }
-        }
-        // معالجة الصوت
-        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+        } else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+            // معالجة الصوت فوراً لمنع تراكم الحزم
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
                     _push_audio_samples(audio_frame);
@@ -391,12 +402,12 @@ void FFmpegPlayer::_decode_next_frame() {
         av_packet_unref(packet);
     }
 
-    // إذا لم نجد فيديو بعد كل هذه المحاولات، قد نكون وصلنا للنهاية
-    if (!got_video && attempts >= MAX_ATTEMPTS) {
-        // لا نفعل شيئاً هنا، الـ _process ستتكفل بالوقت
-    }
-
     av_frame_free(&audio_frame);
+    av_frame_free(&video_frame);
+    av_frame_free(&rgb_frame);
+    av_packet_free(&packet);
+}
+
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
