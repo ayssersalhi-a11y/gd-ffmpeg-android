@@ -237,16 +237,19 @@ void FFmpegPlayer::_allocate_buffers() {
 }
 
 void FFmpegPlayer::_clear_audio_buffers() {
-    // تنظيف مكتبة إعادة العينات
+    // تنظيف مكتبة إعادة العينات (FFmpeg Side)
     if (swr_ctx) {
         swr_close(swr_ctx);
         swr_init(swr_ctx);
     }
-    // تنظيف مخزن Godot الصوتي لمنع التكرار أو التأخير
+    
+    // تنظيف مخزن Godot الصوتي (Godot Side)
+    // بما أن دالة clear() غير مدعومة، نقوم بإيقاف وتشغيل المشغل لتفريغ الـ Buffer داخلياً
     if (audio_player) {
-        Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-        if (playback.is_valid()) {
-            playback->clear();
+        bool was_playing = playing;
+        audio_player->stop(); 
+        if (was_playing) {
+            audio_player->play();
         }
     }
 }
