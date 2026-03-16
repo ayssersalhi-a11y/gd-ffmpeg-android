@@ -90,8 +90,11 @@ private:
     uint8_t          *frame_buffer;
     Ref<ImageTexture>  current_texture;
 
+    // تخزين pts آخر إطار فيديو
+    int64_t last_frame_pts = -1;
+
+    // دالة معالجة الصوت
+    void _push_audio_frame(AVFrame *aframe);
+
     void _decode_next_frame();
     void _cleanup();
-};
-
-} // namespace godot
