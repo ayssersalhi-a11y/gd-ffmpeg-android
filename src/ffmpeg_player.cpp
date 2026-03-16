@@ -186,10 +186,90 @@ bool FFmpegPlayer::load_video(const String &path) {
     } else {
         // لا يوجد صوت — أوقف أي تشغيل سابق
         audio_player->stop();
+bool FFmpegPlayer::load_video(const String &path) {
+    _cleanup();
+
+    if (!audio_player) {
+        audio_player = memnew(AudioStreamPlayer);
+        audio_player->set_name("_AudioPlayer");
+        add_child(audio_player);
+    }
+
+    String real_path = ProjectSettings::get_singleton()->globalize_path(path);
+    CharString cs = real_path.utf8();
+    const char *file_path = cs.get_data();
+
+    int ret = avformat_open_input(&fmt_ctx, file_path, nullptr, nullptr);
+    if (ret < 0) {
+        char err[256]; av_strerror(ret, err, sizeof(err));
+        _emit_video_loaded(false);
+        _emit_playback_error(String("Failed to open file: ") + err);
+        return false;
+    }
+
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        _emit_video_loaded(false);
+        _emit_playback_error("Failed to read stream info");
+        _cleanup();
+        return false;
+    }
+
+    video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+
+    if (video_stream_idx < 0) {
+        _emit_video_loaded(false);
+        _emit_playback_error("No video stream found");
+        _cleanup();
+        return false;
+    }
+
+    AVStream *vstream = fmt_ctx->streams[video_stream_idx];
+    const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
+    if (!vcodec) {
+        _emit_video_loaded(false);
+        _emit_playback_error("Unsupported video codec");
+        _cleanup();
+        return false;
+    }
+
+    video_codec_ctx = avcodec_alloc_context3(vcodec);
+    avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
+    if (avcodec_open2(video_codec_ctx, vcodec, nullptr) < 0) {
+        _emit_video_loaded(false);
+        _emit_playback_error("Failed to open video decoder");
+        _cleanup();
+        return false;
+    }
+
+    video_width  = video_codec_ctx->width;
+    video_height = video_codec_ctx->height;
+    AVRational fr = vstream->r_frame_rate;
+    fps = (fr.den > 0) ? (double)fr.num / fr.den : 30.0;
+
+    sws_ctx = sws_getContext(
+        video_width, video_height, video_codec_ctx->pix_fmt,
+        video_width, video_height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    if (!sws_ctx) {
+        _emit_video_loaded(false);
+        _emit_playback_error("Failed to create image scaler");
+        _cleanup();
+        return false;
+    }
+
+    int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
+    frame_buffer = (uint8_t *)av_malloc(buf_size);
+
+    if (audio_stream_idx >= 0) {
+        AVStream *astream = fmt_ctx->streams[audio_stream_idx];
+        _setup_audio(astream);
+    } else {
+        audio_player->stop();
         audio_generator.unref();
     }
 
-    // مدة الفيديو
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE)
                ? (double)fmt_ctx->duration / AV_TIME_BASE
                : 0.0;
@@ -197,10 +277,9 @@ bool FFmpegPlayer::load_video(const String &path) {
     current_texture.instantiate();
     position = 0.0;
 
-    emit_signal("video_loaded", true);
+    _emit_video_loaded(true);
     return true;
 }
-
 // ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     if (!astream || !astream->codecpar) {
@@ -343,26 +422,22 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame  *audio_frame = av_frame_alloc();
 
     bool got_video = false;
-    int  max_packets = 200; // حد أقصى لمنع تعليق التطبيق
+    int  max_packets = 200;
 
     while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
 
-        // ── فيديو
         if (packet->stream_index == video_stream_idx && video_codec_ctx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
                     av_image_fill_arrays(
                         rgb_frame->data, rgb_frame->linesize,
-                        frame_buffer,
-                        AV_PIX_FMT_RGB24,
+                        frame_buffer, AV_PIX_FMT_RGB24,
                         video_width, video_height, 1
                     );
 
                     sws_scale(
-                        sws_ctx,
-                        video_frame->data, video_frame->linesize,
-                        0, video_height,
-                        rgb_frame->data, rgb_frame->linesize
+                        sws_ctx, video_frame->data, video_frame->linesize,
+                        0, video_height, rgb_frame->data, rgb_frame->linesize
                     );
 
                     PackedByteArray pba;
@@ -375,15 +450,12 @@ void FFmpegPlayer::_decode_next_frame() {
                         Image::FORMAT_RGB8, pba
                     );
 
-                    if (!current_texture.is_valid()) {
+                    if (!current_texture.is_valid())
                         current_texture = ImageTexture::create_from_image(img);
-                    } else {
+                    else
                         current_texture->update(img);
-                    }
 
-                    // إشارات الفيديو
-                    if (is_inside_tree())
-                        emit_signal("frame_updated", current_texture);
+                    _emit_frame_updated(); // ✅ استخدام الدالة الآمنة
 
                     av_frame_unref(video_frame);
                     got_video = true;
@@ -392,7 +464,6 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
 
-        // ── صوت
         if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
