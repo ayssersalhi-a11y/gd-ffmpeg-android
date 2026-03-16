@@ -346,8 +346,6 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
 
-    // قراءة حزمة واحدة فقط في كل استدعاء (مثل كودك القديم الناجح)
-    // هذا يمنع تجمد الصورة ويحافظ على سلاسة Godot
     if (av_read_frame(fmt_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
@@ -363,11 +361,18 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    // تحديث التكستشر
+                    // --- الإصلاح الذكي للحجم والتهيئة ---
                     if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
-                        current_texture->update(img);
+                        // نتحقق إذا كان حجم الصورة الجديدة يطابق حجم التكستشر الحالي
+                        if (current_texture->get_width() != video_width || current_texture->get_height() != video_height) {
+                            // إذا اختلف الحجم (بسبب تغيير جودة الفيديو مثلاً)، نعيد الإنشاء
+                            current_texture = ImageTexture::create_from_image(img);
+                        } else {
+                            // إذا كان الحجم متطابقاً، نحدث البيانات فقط (الأداء الأفضل)
+                            current_texture->update(img);
+                        }
                     }
 
                     _emit_frame_updated();
