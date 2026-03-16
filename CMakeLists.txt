@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   ├── CMakeLists.txt          (هذا الملف)
 #   ├── src/
 #   │   └── ffmpeg_player.cpp
-#   ├── include/
+#   ├── inنclude/
 #   │   └── ffmpeg_player.h
 #   ├── godot-cpp/              (استنسخ من: github.com/godotengine/godot-cpp)
 #   └── ffmpeg-android/         (مخرجات بناء FFmpeg لـ Android)
