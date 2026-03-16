@@ -39,6 +39,7 @@ void FFmpegPlayer::_bind_methods() {
     ClassDB::bind_method(D_METHOD("load_video", "path"),        &FFmpegPlayer::load_video);
     ClassDB::bind_method(D_METHOD("play"),                      &FFmpegPlayer::play);
     ClassDB::bind_method(D_METHOD("pause"),                     &FFmpegPlayer::pause);
+    ClassDB::bind_method(D_METHOD("_process", "delta"),         &FFmpegPlayer::_process);
     ClassDB::bind_method(D_METHOD("stop"),                      &FFmpegPlayer::stop);
     ClassDB::bind_method(D_METHOD("seek", "seconds"),           &FFmpegPlayer::seek);
 
@@ -71,6 +72,7 @@ void FFmpegPlayer::_bind_methods() {
 
 // ─── البنّاء والهادم ──────────────────────────────────────────────────────────
 FFmpegPlayer::FFmpegPlayer()
+FFmpegPlayer::FFmpegPlayer()
     : fmt_ctx(nullptr),
       video_codec_ctx(nullptr),
       audio_codec_ctx(nullptr),
@@ -87,6 +89,9 @@ FFmpegPlayer::FFmpegPlayer()
       video_height(0),
       fps(0.0),
       frame_buffer(nullptr)
+{
+    set_process(true);
+}
 {}
 
 FFmpegPlayer::~FFmpegPlayer() {
@@ -172,6 +177,12 @@ bool FFmpegPlayer::load_video(const String &path) {
     // تخصيص مخزن الإطار
     int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
     frame_buffer = (uint8_t *)av_malloc(buf_size);
+
+    if (!frame_buffer) {
+        emit_signal("playback_error", "فشل تخصيص الذاكرة");
+        _cleanup();
+        return false;
+    }
 
     // الصوت (اختياري)
     if (audio_stream_idx >= 0) {
