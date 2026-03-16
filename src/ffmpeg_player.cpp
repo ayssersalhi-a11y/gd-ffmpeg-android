@@ -203,52 +203,50 @@ bool FFmpegPlayer::load_video(const String &path) {
 
 // ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
-    const AVCodec *acodec = avcodec_find_decoder(astream->codecpar->codec_id);
-    if (!acodec) return false;
-
-    audio_codec_ctx = avcodec_alloc_context3(acodec);
-    avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar);
-    if (avcodec_open2(audio_codec_ctx, acodec, nullptr) < 0) {
-        avcodec_free_context(&audio_codec_ctx);
+    if (!astream || !astream->codecpar) {
+        _emit_playback_error("Audio stream invalid");
         return false;
     }
 
-    // معدل العينات المُخرج: نستخدم معدل الملف الأصلي (أقصى جودة)
+    audio_codec_ctx = avcodec_alloc_context3(nullptr);
+    if (!audio_codec_ctx) {
+        _emit_playback_error("Failed to allocate audio codec context");
+        return false;
+    }
+
+    if (avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar) < 0) {
+        _emit_playback_error("Failed to copy audio codec parameters");
+        return false;
+    }
+
+    AVCodec *codec = avcodec_find_decoder(audio_codec_ctx->codec_id);
+    if (!codec) {
+        _emit_playback_error("Audio codec not found");
+        return false;
+    }
+
+    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) {
+        _emit_playback_error("Failed to open audio codec");
+        return false;
+    }
+
+    swr_ctx = swr_alloc();
+    av_opt_set_channel_layout(swr_ctx, "in_channel_layout",  audio_codec_ctx->channel_layout, 0);
+    av_opt_set_channel_layout(swr_ctx, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate",  audio_codec_ctx->sample_rate, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx->sample_rate, 0);
+    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  audio_codec_ctx->sample_fmt, 0);
+    av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+
+    if (swr_init(swr_ctx) < 0) {
+        _emit_playback_error("Failed to initialize audio resampler");
+        return false;
+    }
+
     audio_sample_rate = audio_codec_ctx->sample_rate;
-    audio_channels    = 2; // دائماً stereo للـ AudioStreamGenerator
-
-    // ── SwrContext: يحوّل أي صيغة صوت إلى Float Interleaved Stereo ──────────
-    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
-    int swr_ret = swr_alloc_set_opts2(
-        &swr_ctx,
-        &out_layout,                    // output: stereo
-        AV_SAMPLE_FMT_FLT,             // output format: float interleaved
-        audio_sample_rate,              // output sample rate
-        &audio_codec_ctx->ch_layout,   // input layout (من الملف)
-        audio_codec_ctx->sample_fmt,   // input format (من الملف)
-        audio_codec_ctx->sample_rate,  // input sample rate
-        0, nullptr
-    );
-
-    if (swr_ret < 0 || swr_init(swr_ctx) < 0) {
-        swr_free(&swr_ctx);
-        avcodec_free_context(&audio_codec_ctx);
-        return false;
-    }
-
-    // ── AudioStreamGenerator ─────────────────────────────────────────────────
-    audio_generator.instantiate();
-    audio_generator->set_mix_rate((float)audio_sample_rate);
-    // حجم البفر = 0.1 ثانية (يمنع التقطّع دون تأخير ملحوظ)
-    audio_generator->set_buffer_length(0.1f);
-
-    audio_player->set_stream(audio_generator);
-    audio_player->set_volume_db(UtilityFunctions::linear_to_db(volume));
-    // لا نشغّل AudioStreamPlayer الآن — ينتظر play()
-
+    audio_channels    = 2; // ستيريو
     return true;
 }
-
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
@@ -313,20 +311,31 @@ void FFmpegPlayer::_process(double delta) {
 
     _decode_next_frame();
 }
+// ── إشارات آمنة ─────────────────────────────────────────────
+void FFmpegPlayer::_emit_video_loaded(bool success) {
+    if (is_inside_tree()) {
+        emit_signal("video_loaded", success);
+    }
+}
 
-// ─── فكّ الترميز: فيديو + صوت معاً ─────────────────────────────────────────
-void FFmpegPlayer::_decode_next_frame() {
-    AVPacket *packet     = av_packet_alloc();
-    AVFrame  *frame      = av_frame_alloc();
-    AVFrame  *rgb        = av_frame_alloc();
-    AVFrame  *audio_frame = av_frame_alloc();
+void FFmpegPlayer::_emit_video_finished() {
+    if (is_inside_tree()) {
+        emit_signal("video_finished");
+    }
+}
 
-    bool got_video   = false;
-    int  max_packets = 200; // حد أقصى لمنع التعليق
+void FFmpegPlayer::_emit_frame_updated() {
+    if (is_inside_tree()) {
+        emit_signal("frame_updated", current_texture);
+    }
+}
 
-    while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
-
-        // ── فيديو ─────────────────────────────────────────────────────────────
+void FFmpegPlayer::_emit_playback_error(const String &message) {
+    if (is_inside_tree()) {
+        emit_signal("playback_error", message);
+    }
+}
+// ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 void FFmpegPlayer::_decode_next_frame() {
     AVPacket *packet      = av_packet_alloc();
     AVFrame  *video_frame = av_frame_alloc();
@@ -334,11 +343,11 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame  *audio_frame = av_frame_alloc();
 
     bool got_video = false;
-    int  max_packets = 200; // من النسخة القديمة لمنع التعليق
+    int  max_packets = 200; // حد أقصى لمنع تعليق التطبيق
 
     while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
 
-        // فيديو
+        // ── فيديو
         if (packet->stream_index == video_stream_idx && video_codec_ctx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
@@ -372,7 +381,10 @@ void FFmpegPlayer::_decode_next_frame() {
                         current_texture->update(img);
                     }
 
-                    emit_signal("frame_updated", current_texture);
+                    // إشارات الفيديو
+                    if (is_inside_tree())
+                        emit_signal("frame_updated", current_texture);
+
                     av_frame_unref(video_frame);
                     got_video = true;
                     break;
@@ -380,7 +392,7 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
 
-        // صوت
+        // ── صوت
         if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
@@ -398,59 +410,32 @@ void FFmpegPlayer::_decode_next_frame() {
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
 }
-
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!audio_player || !audio_player->is_playing()) return;
+    if (!frame || !audio_generator) return;
 
-    Ref<AudioStreamGeneratorPlayback> playback =
-        audio_player->get_stream_playback();
-    if (playback.is_null()) return;
+    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
+                                     audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
 
-    // احسب عدد العينات المُخرجة بعد إعادة التعيين
-    int64_t delay      = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
-    int out_count      = (int)av_rescale_rnd(
-        delay + frame->nb_samples,
-        audio_sample_rate,
-        audio_codec_ctx->sample_rate,
-        AV_ROUND_UP
-    );
+    float **out = nullptr;
+    av_samples_alloc_array_and_samples((uint8_t ***)&out, nullptr, audio_channels, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    int converted_samples = swr_convert(swr_ctx, (uint8_t**)out, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
 
-    // خصّص مخزن مؤقت لعينات Float Interleaved
-    uint8_t *out_buf = nullptr;
-    int out_linesize  = 0;
-    if (av_samples_alloc(&out_buf, &out_linesize, 2, out_count, AV_SAMPLE_FMT_FLT, 0) < 0) {
-        return;
-    }
-
-    int converted = swr_convert(
-        swr_ctx,
-        &out_buf,                        out_count,
-        (const uint8_t **)frame->data,   frame->nb_samples
-    );
-
-    if (converted > 0) {
-        const float *samples = reinterpret_cast<const float *>(out_buf);
-
-        // تحقّق من مساحة البفر المتاحة
-        int frames_available = playback->get_frames_available();
-        int to_push          = MIN(converted, frames_available);
-
-        PackedVector2Array audio_frames;
-        audio_frames.resize(to_push);
-        Vector2 *ptr = audio_frames.ptrw();
-
-        for (int i = 0; i < to_push; i++) {
-            float l = samples[i * 2]     * volume;
-            float r = samples[i * 2 + 1] * volume;
-            // حدّ القيم لمنع التشويه
-            ptr[i] = Vector2(CLAMP(l, -1.0f, 1.0f), CLAMP(r, -1.0f, 1.0f));
+    if (converted_samples > 0) {
+        AudioStreamGeneratorPlayback *playback = audio_generator->get_playback();
+        if (playback) {
+            for (int i = 0; i < converted_samples; ++i) {
+                for (int ch = 0; ch < audio_channels; ++ch) {
+                    playback->push_frame(Vector2(out[ch][i], out[ch][i]));
+                }
+            }
         }
-
-        playback->push_buffer(audio_frames);
     }
 
-    av_freep(&out_buf);
+    if (out) {
+        av_freep(&out[0]);
+        av_freep(&out);
+    }
 }
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
@@ -480,27 +465,35 @@ float FFmpegPlayer::get_volume() const { return volume; }
 
 // ─── تنظيف الموارد ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
-    playing = false;
-
-    if (audio_player) {
-        audio_player->stop();
-        audio_generator.unref();
+    if (video_codec_ctx) {
+        avcodec_free_context(&video_codec_ctx);
+        video_codec_ctx = nullptr;
     }
 
-    if (swr_ctx)         { swr_free(&swr_ctx);                    swr_ctx = nullptr; }
-    if (sws_ctx)         { sws_freeContext(sws_ctx);              sws_ctx = nullptr; }
-    if (audio_codec_ctx) { avcodec_free_context(&audio_codec_ctx); audio_codec_ctx = nullptr; }
-    if (video_codec_ctx) { avcodec_free_context(&video_codec_ctx); video_codec_ctx = nullptr; }
-    if (fmt_ctx)         { avformat_close_input(&fmt_ctx);         fmt_ctx = nullptr; }
-    if (frame_buffer)    { av_free(frame_buffer);                  frame_buffer = nullptr; }
+    if (audio_codec_ctx) {
+        avcodec_free_context(&audio_codec_ctx);
+        audio_codec_ctx = nullptr;
+    }
 
-    video_stream_idx = audio_stream_idx = -1;
-    duration = position = 0.0;
-    video_width = video_height = 0;
-    fps = 0.0;
+    if (fmt_ctx) {
+        avformat_close_input(&fmt_ctx);
+        fmt_ctx = nullptr;
+    }
 
-    // تحسين من القديم: التأكد من تحرير الـ Texture
-    current_texture.unref();
+    if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+        sws_ctx = nullptr;
+    }
+
+    if (swr_ctx) {
+        swr_free(&swr_ctx);
+        swr_ctx = nullptr;
+    }
+
+    if (frame_buffer) {
+        av_free(frame_buffer);
+        frame_buffer = nullptr;
+    }
 }
 
 // ─── نقطة دخول GDExtension ───────────────────────────────────────────────────
