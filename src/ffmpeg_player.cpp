@@ -99,109 +99,20 @@ void FFmpegPlayer::_ready() {
 bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
 
-    // إعادة إنشاء AudioStreamPlayer إذا فُقد بعد _cleanup
     if (!audio_player) {
         audio_player = memnew(AudioStreamPlayer);
         audio_player->set_name("_AudioPlayer");
         add_child(audio_player);
     }
 
-    // تحويل مسار Godot إلى مسار نظام الملفات
     String real_path = ProjectSettings::get_singleton()->globalize_path(path);
     CharString cs = real_path.utf8();
     const char *file_path = cs.get_data();
 
-    // فتح الملف
     int ret = avformat_open_input(&fmt_ctx, file_path, nullptr, nullptr);
     if (ret < 0) {
-        char err[256];
+        char err[256]; 
         av_strerror(ret, err, sizeof(err));
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", String("Failed to open file: ") + err);
-        return false;
-    }
-
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", "Failed to read stream info");
-        _cleanup();
-        return false;
-    }
-
-    // إيجاد مقطعَي الفيديو والصوت
-    video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-
-    if (video_stream_idx < 0) {
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", "No video stream found");
-        _cleanup();
-        return false;
-    }
-
-    // ── فتح مفكك ترميز الفيديو ───────────────────────────────────────────────
-    AVStream *vstream = fmt_ctx->streams[video_stream_idx];
-    const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
-    if (!vcodec) {
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", "Unsupported video codec");
-        _cleanup();
-        return false;
-    }
-
-    video_codec_ctx = avcodec_alloc_context3(vcodec);
-    avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-    if (avcodec_open2(video_codec_ctx, vcodec, nullptr) < 0) {
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", "Failed to open video decoder");
-        _cleanup();
-        return false;
-    }
-
-    video_width  = video_codec_ctx->width;
-    video_height = video_codec_ctx->height;
-    AVRational fr = vstream->r_frame_rate;
-    fps = (fr.den > 0) ? (double)fr.num / fr.den : 30.0;
-
-    // محوّل الصورة RGB24
-    sws_ctx = sws_getContext(
-        video_width, video_height, video_codec_ctx->pix_fmt,
-        video_width, video_height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-    if (!sws_ctx) {
-        emit_signal("video_loaded", false);
-        emit_signal("playback_error", "Failed to create image scaler");
-        _cleanup();
-        return false;
-    }
-
-    int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
-    frame_buffer = (uint8_t *)av_malloc(buf_size);
-
-    // ── إعداد الصوت ───────────────────────────────────────────────────────────
-    if (audio_stream_idx >= 0) {
-        AVStream *astream = fmt_ctx->streams[audio_stream_idx];
-        _setup_audio(astream);
-    } else {
-        // لا يوجد صوت — أوقف أي تشغيل سابق
-        audio_player->stop();
-bool FFmpegPlayer::load_video(const String &path) {
-    _cleanup();
-
-    if (!audio_player) {
-        audio_player = memnew(AudioStreamPlayer);
-        audio_player->set_name("_AudioPlayer");
-        add_child(audio_player);
-    }
-
-    String real_path = ProjectSettings::get_singleton()->globalize_path(path);
-    CharString cs = real_path.utf8();
-    const char *file_path = cs.get_data();
-
-    int ret = avformat_open_input(&fmt_ctx, file_path, nullptr, nullptr);
-    if (ret < 0) {
-        char err[256]; av_strerror(ret, err, sizeof(err));
         _emit_video_loaded(false);
         _emit_playback_error(String("Failed to open file: ") + err);
         return false;
@@ -260,13 +171,14 @@ bool FFmpegPlayer::load_video(const String &path) {
     }
 
     int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
+    if (frame_buffer) av_free(frame_buffer);
     frame_buffer = (uint8_t *)av_malloc(buf_size);
 
     if (audio_stream_idx >= 0) {
         AVStream *astream = fmt_ctx->streams[audio_stream_idx];
         _setup_audio(astream);
     } else {
-        audio_player->stop();
+        if (audio_player) audio_player->stop();
         audio_generator.unref();
     }
 
@@ -280,6 +192,7 @@ bool FFmpegPlayer::load_video(const String &path) {
     _emit_video_loaded(true);
     return true;
 }
+
 // ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     if (!astream || !astream->codecpar) {
