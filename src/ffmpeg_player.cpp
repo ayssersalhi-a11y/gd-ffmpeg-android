@@ -291,23 +291,22 @@ void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
 
     position += delta;
-
-    // التحكم في سرعة العرض: لا تفك الإطار التالي إلا إذا حان وقته بناءً على الـ FPS
-    // هذا يمنع استهلاك المعالج بنسبة 100% ويمنع توقف الفيديو المفاجئ
     static double accumulator = 0.0;
     accumulator += delta;
 
-    if (accumulator >= (1.0 / fps)) {
+    double frame_time = 1.0 / fps;
+
+    // معالجة "إطارات التعويض" إذا تأخر النظام
+    while (accumulator >= frame_time) {
         _decode_next_frame();
-        accumulator = 0.0;
+        accumulator -= frame_time;
     }
 
     if (duration > 0.0 && position >= duration) {
         if (looping) {
             seek(0.0);
         } else {
-            playing = false;
-            if (audio_player) audio_player->stop();
+            stop();
             _emit_video_finished();
         }
     }
@@ -346,11 +345,15 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
 
-    if (av_read_frame(fmt_ctx, packet) >= 0) {
+    bool frame_finished = false;
+    int max_retries = 50; // البحث في 50 حزمة كحد أقصى للعثور على فيديو
+
+    while (!frame_finished && max_retries > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
+        max_retries--;
+
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                    
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                     sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
 
@@ -361,25 +364,20 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    // --- الإصلاح الذكي للحجم والتهيئة ---
                     if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
-                        // نتحقق إذا كان حجم الصورة الجديدة يطابق حجم التكستشر الحالي
                         if (current_texture->get_width() != video_width || current_texture->get_height() != video_height) {
-                            // إذا اختلف الحجم (بسبب تغيير جودة الفيديو مثلاً)، نعيد الإنشاء
                             current_texture = ImageTexture::create_from_image(img);
                         } else {
-                            // إذا كان الحجم متطابقاً، نحدث البيانات فقط (الأداء الأفضل)
                             current_texture->update(img);
                         }
                     }
-
                     _emit_frame_updated();
+                    frame_finished = true;
                 }
             }
-        } 
-        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+        } else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
             AVFrame *audio_frame = av_frame_alloc();
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
@@ -397,17 +395,13 @@ void FFmpegPlayer::_decode_next_frame() {
 }
 
 
+
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (!playback.is_valid()) return;
-
-    // التحقق من المساحة الفارغة في مخزن الصوت لتجنب التشويش (Stuttering)
-    if (playback->get_skips() > 0) {
-        // إذا كان هناك تخطي، لا نضغط على المعالج أكثر
-    }
 
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
                                      audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
@@ -417,12 +411,11 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     int converted_samples = swr_convert(swr_ctx, (uint8_t**)out, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
 
     if (converted_samples > 0) {
-        // دفع العينات فقط إذا كان هناك مساحة كافية في الـ Buffer
-        int available = playback->get_frames_available();
-        int to_push = (converted_samples < available) ? converted_samples : available;
-        
-        for (int i = 0; i < to_push; ++i) {
-            playback->push_frame(Vector2(out[0][i], out[1][i]));
+        for (int i = 0; i < converted_samples; ++i) {
+            // محاولة دفع الإطار، وإذا كان الـ Buffer ممتلئ، ننتظر قليلاً أو نتخطى بذكاء
+            if (playback->can_push_buffer(1)) {
+                playback->push_frame(Vector2(out[0][i], out[1][i]));
+            }
         }
     }
 
@@ -431,6 +424,7 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         av_freep(&out);
     }
 }
+
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
 bool   FFmpegPlayer::is_playing()    const { return playing; }
