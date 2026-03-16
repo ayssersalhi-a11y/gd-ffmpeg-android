@@ -91,7 +91,7 @@ FFmpegPlayer::FFmpegPlayer()
 {
     set_process(true);
 }
-{}
+
 
 FFmpegPlayer::~FFmpegPlayer() {
     _cleanup();
