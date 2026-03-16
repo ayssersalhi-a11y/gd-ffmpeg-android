@@ -224,7 +224,6 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
 
     swr_ctx = swr_alloc();
     
-    // إعداد التخطيط الصوتي للنسخ الجديدة من FFmpeg
     AVChannelLayout out_ch_layout;
     av_channel_layout_default(&out_ch_layout, 2); // Stereo
 
@@ -240,11 +239,20 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
         return false;
     }
 
+    // تهيئة الـ Generator وربطه بالمشغل
+    audio_generator.instantiate();
+    audio_generator->set_mix_rate(audio_codec_ctx->sample_rate);
+    audio_generator->set_buffer_length(0.1);
+
+    if (audio_player) {
+        audio_player->set_stream(audio_generator);
+    }
+
     audio_sample_rate = audio_codec_ctx->sample_rate;
-    audio_channels    = 2;
+    audio_channels = 2;
     return true;
 }
-}
+
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
@@ -403,7 +411,11 @@ void FFmpegPlayer::_decode_next_frame() {
 }
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_generator) return;
+    if (!frame || !audio_player) return;
+
+    // في Godot 4، نحصل على الـ Playback من الـ Player مباشرة بعد وضع الـ Stream
+    Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
+    if (!playback.is_valid()) return;
 
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
                                      audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
@@ -413,13 +425,9 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     int converted_samples = swr_convert(swr_ctx, (uint8_t**)out, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
 
     if (converted_samples > 0) {
-        AudioStreamGeneratorPlayback *playback = audio_generator->get_playback();
-        if (playback) {
-            for (int i = 0; i < converted_samples; ++i) {
-                for (int ch = 0; ch < audio_channels; ++ch) {
-                    playback->push_frame(Vector2(out[ch][i], out[ch][i]));
-                }
-            }
+        for (int i = 0; i < converted_samples; ++i) {
+            // دفع الصوت لكلتا القناتين (يسار ويمين)
+            playback->push_frame(Vector2(out[0][i], out[1][i]));
         }
     }
 
@@ -428,6 +436,7 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         av_freep(&out);
     }
 }
+
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
 bool   FFmpegPlayer::is_playing()    const { return playing; }
