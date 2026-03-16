@@ -122,7 +122,15 @@ private:
 
     // ── مستقبلي: دعم الترجمات أو تأثيرات الفيديو ─────────────────────────────
     // std::vector<AVSubtitle> subtitles;
-    // SwsFilterContext* filter_ctx;
+// SwsFilterContext* filter_ctx;
+// أضف هذه الدوال داخل الكلاس FFmpegPlayer في ملف ffmpeg_player.h
+private:
+    void _emit_video_loaded(bool success);
+    void _emit_video_finished();
+    void _emit_frame_updated();
+    void _emit_playback_error(const String &message);
+
 };
 
 } // namespace godot
+
