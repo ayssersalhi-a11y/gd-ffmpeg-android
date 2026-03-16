@@ -39,7 +39,6 @@ void FFmpegPlayer::_bind_methods() {
     ClassDB::bind_method(D_METHOD("load_video", "path"),        &FFmpegPlayer::load_video);
     ClassDB::bind_method(D_METHOD("play"),                      &FFmpegPlayer::play);
     ClassDB::bind_method(D_METHOD("pause"),                     &FFmpegPlayer::pause);
-    ClassDB::bind_method(D_METHOD("_process", "delta"),         &FFmpegPlayer::_process);
     ClassDB::bind_method(D_METHOD("stop"),                      &FFmpegPlayer::stop);
     ClassDB::bind_method(D_METHOD("seek", "seconds"),           &FFmpegPlayer::seek);
 
