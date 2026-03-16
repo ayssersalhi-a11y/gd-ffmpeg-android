@@ -200,7 +200,13 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
         return false;
     }
 
-    audio_codec_ctx = avcodec_alloc_context3(nullptr);
+    const AVCodec *codec = avcodec_find_decoder(astream->codecpar->codec_id);
+    if (!codec) {
+        _emit_playback_error("Audio codec not found");
+        return false;
+    }
+
+    audio_codec_ctx = avcodec_alloc_context3(codec);
     if (!audio_codec_ctx) {
         _emit_playback_error("Failed to allocate audio codec context");
         return false;
@@ -211,22 +217,21 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
         return false;
     }
 
-    AVCodec *codec = avcodec_find_decoder(audio_codec_ctx->codec_id);
-    if (!codec) {
-        _emit_playback_error("Audio codec not found");
-        return false;
-    }
-
     if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) {
         _emit_playback_error("Failed to open audio codec");
         return false;
     }
 
     swr_ctx = swr_alloc();
-    av_opt_set_channel_layout(swr_ctx, "in_channel_layout",  audio_codec_ctx->channel_layout, 0);
-    av_opt_set_channel_layout(swr_ctx, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-    av_opt_set_int(swr_ctx, "in_sample_rate",  audio_codec_ctx->sample_rate, 0);
-    av_opt_set_int(swr_ctx, "out_sample_rate", audio_codec_ctx->sample_rate, 0);
+    
+    // إعداد التخطيط الصوتي للنسخ الجديدة من FFmpeg
+    AVChannelLayout out_ch_layout;
+    av_channel_layout_default(&out_ch_layout, 2); // Stereo
+
+    av_opt_set_chlayout(swr_ctx, "in_chlayout",  &audio_codec_ctx->ch_layout, 0);
+    av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate",    audio_codec_ctx->sample_rate, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate",   audio_codec_ctx->sample_rate, 0);
     av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  audio_codec_ctx->sample_fmt, 0);
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
@@ -236,8 +241,9 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     }
 
     audio_sample_rate = audio_codec_ctx->sample_rate;
-    audio_channels    = 2; // ستيريو
+    audio_channels    = 2;
     return true;
+}
 }
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
@@ -296,13 +302,14 @@ void FFmpegPlayer::_process(double delta) {
         } else {
             playing = false;
             if (audio_player) audio_player->stop();
-            emit_signal("video_finished");
+            _emit_video_finished(); // تم التغيير هنا لتجنب الخطأ
             return;
         }
     }
 
     _decode_next_frame();
 }
+
 // ── إشارات آمنة ─────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool success) {
     if (is_inside_tree()) {
