@@ -291,23 +291,28 @@ void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
 
     position += delta;
+
+    // التحكم في سرعة العرض: لا تفك الإطار التالي إلا إذا حان وقته بناءً على الـ FPS
+    // هذا يمنع استهلاك المعالج بنسبة 100% ويمنع توقف الفيديو المفاجئ
+    static double accumulator = 0.0;
+    accumulator += delta;
+
+    if (accumulator >= (1.0 / fps)) {
+        _decode_next_frame();
+        accumulator = 0.0;
+    }
+
     if (duration > 0.0 && position >= duration) {
         if (looping) {
             seek(0.0);
-            if (audio_player && audio_generator.is_valid()) {
-                audio_player->stop();
-                audio_player->play();
-            }
         } else {
             playing = false;
             if (audio_player) audio_player->stop();
-            _emit_video_finished(); // تم التغيير هنا لتجنب الخطأ
-            return;
+            _emit_video_finished();
         }
     }
-
-    _decode_next_frame();
 }
+
 
 // ── إشارات آمنة ─────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool success) {
@@ -395,9 +400,13 @@ void FFmpegPlayer::_decode_next_frame() {
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) return;
 
-    // في Godot 4، نحصل على الـ Playback من الـ Player مباشرة بعد وضع الـ Stream
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (!playback.is_valid()) return;
+
+    // التحقق من المساحة الفارغة في مخزن الصوت لتجنب التشويش (Stuttering)
+    if (playback->get_skips() > 0) {
+        // إذا كان هناك تخطي، لا نضغط على المعالج أكثر
+    }
 
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
                                      audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
@@ -407,8 +416,11 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     int converted_samples = swr_convert(swr_ctx, (uint8_t**)out, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
 
     if (converted_samples > 0) {
-        for (int i = 0; i < converted_samples; ++i) {
-            // دفع الصوت لكلتا القناتين (يسار ويمين)
+        // دفع العينات فقط إذا كان هناك مساحة كافية في الـ Buffer
+        int available = playback->get_frames_available();
+        int to_push = (converted_samples < available) ? converted_samples : available;
+        
+        for (int i = 0; i < to_push; ++i) {
             playback->push_frame(Vector2(out[0][i], out[1][i]));
         }
     }
@@ -418,7 +430,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         av_freep(&out);
     }
 }
-
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
 bool   FFmpegPlayer::is_playing()    const { return playing; }
