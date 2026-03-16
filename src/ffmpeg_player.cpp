@@ -52,14 +52,16 @@ void FFmpegPlayer::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_current_frame_texture"), &FFmpegPlayer::get_current_frame_texture);
 
     // --- خصائص ---
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL,  "loop"),   "set_loop",   "get_loop");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volume"), "set_volume", "get_volume");
+
 
     ClassDB::bind_method(D_METHOD("set_loop",   "enable"), &FFmpegPlayer::set_loop);
     ClassDB::bind_method(D_METHOD("get_loop"),             &FFmpegPlayer::get_loop);
     ClassDB::bind_method(D_METHOD("set_volume", "vol"),    &FFmpegPlayer::set_volume);
     ClassDB::bind_method(D_METHOD("get_volume"),           &FFmpegPlayer::get_volume);
 
+
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL,  "loop"),   "set_loop",   "get_loop");
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volume"), "set_volume", "get_volume");
     // --- إشارات ---
     ADD_SIGNAL(MethodInfo("video_finished"));
     ADD_SIGNAL(MethodInfo("video_loaded",   PropertyInfo(Variant::BOOL, "success")));
