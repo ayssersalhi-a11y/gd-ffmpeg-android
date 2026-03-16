@@ -98,6 +98,8 @@ private:
     void _decode_next_frame();
     void _push_audio_samples(AVFrame *frame);
     void _cleanup();
+    void _allocate_buffers();      // دالة تنظيم الذاكرة
+    void _clear_audio_buffers();   // دالة تنظيف الصوت
 
     // ── دوال إرسال الإشارات الآمنة ─────────────────────────────────────────────
     void _emit_video_loaded(bool success);
