@@ -341,7 +341,7 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame  *audio_frame = av_frame_alloc();
 
     bool got_video = false;
-    int  max_packets = 100; // تقليل العدد لزيادة الاستجابة
+    int  max_packets = 100; 
 
     while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_idx && video_codec_ctx) {
@@ -357,11 +357,13 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    // الإصلاح: التحقق من الصلاحية قبل التحديث (نفس أسلوب كودك القديم الناجح)
-                    if (!current_texture.is_valid() || current_texture.is_null()) {
+                    // --- الإصلاح القاتل للخطأ ---
+                    // نتأكد أولاً أن التكستشر له معرف صالح (RID) في محرك الرسم
+                    if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
-                        current_texture->update(img);
+                        // إذا كان الحجم متطابقاً، نستخدم set_image لضمان التحديث الآمن
+                        current_texture->set_image(img);
                     }
 
                     _emit_frame_updated();
@@ -388,6 +390,7 @@ void FFmpegPlayer::_decode_next_frame() {
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
 }
+
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) return;
