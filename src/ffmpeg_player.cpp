@@ -163,12 +163,6 @@ bool FFmpegPlayer::load_video(const String &path) {
         video_width, video_height, AV_PIX_FMT_RGB24,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
-    if (!sws_ctx) {
-        _emit_video_loaded(false);
-        _emit_playback_error("Failed to create image scaler");
-        _cleanup();
-        return false;
-    }
 
     int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
     if (frame_buffer) av_free(frame_buffer);
@@ -177,21 +171,18 @@ bool FFmpegPlayer::load_video(const String &path) {
     if (audio_stream_idx >= 0) {
         AVStream *astream = fmt_ctx->streams[audio_stream_idx];
         _setup_audio(astream);
-    } else {
-        if (audio_player) audio_player->stop();
-        audio_generator.unref();
     }
 
-    duration = (fmt_ctx->duration != AV_NOPTS_VALUE)
-               ? (double)fmt_ctx->duration / AV_TIME_BASE
-               : 0.0;
-
+    duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
+    
+    // إنشاء التكستشر مسبقاً لمنع خطأ "Not initialized"
     current_texture.instantiate();
+    
     position = 0.0;
-
     _emit_video_loaded(true);
     return true;
 }
+
 
 // ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
@@ -350,41 +341,30 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame  *audio_frame = av_frame_alloc();
 
     bool got_video = false;
-    int  max_packets = 200;
+    int  max_packets = 100; // تقليل العدد لزيادة الاستجابة
 
     while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
-
         if (packet->stream_index == video_stream_idx && video_codec_ctx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                    av_image_fill_arrays(
-                        rgb_frame->data, rgb_frame->linesize,
-                        frame_buffer, AV_PIX_FMT_RGB24,
-                        video_width, video_height, 1
-                    );
-
-                    sws_scale(
-                        sws_ctx, video_frame->data, video_frame->linesize,
-                        0, video_height, rgb_frame->data, rgb_frame->linesize
-                    );
+                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
+                    sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
 
                     PackedByteArray pba;
                     int sz = video_width * video_height * 3;
                     pba.resize(sz);
                     memcpy(pba.ptrw(), frame_buffer, sz);
 
-                    Ref<Image> img = Image::create_from_data(
-                        video_width, video_height, false,
-                        Image::FORMAT_RGB8, pba
-                    );
+                    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    if (!current_texture.is_valid())
+                    // الإصلاح: التحقق من الصلاحية قبل التحديث (نفس أسلوب كودك القديم الناجح)
+                    if (!current_texture.is_valid() || current_texture.is_null()) {
                         current_texture = ImageTexture::create_from_image(img);
-                    else
+                    } else {
                         current_texture->update(img);
+                    }
 
-                    _emit_frame_updated(); // ✅ استخدام الدالة الآمنة
-
+                    _emit_frame_updated();
                     av_frame_unref(video_frame);
                     got_video = true;
                     break;
@@ -400,7 +380,6 @@ void FFmpegPlayer::_decode_next_frame() {
                 }
             }
         }
-
         av_packet_unref(packet);
     }
 
