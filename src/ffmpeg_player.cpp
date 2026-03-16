@@ -206,23 +206,34 @@ bool FFmpegPlayer::load_video(const String &path) {
 }
 
 // ─── تشغيل / إيقاف ───────────────────────────────────────────────────────────
-void FFmpegPlayer::play()  { playing = true;  }
-void FFmpegPlayer::pause() { playing = false; }
-void FFmpegPlayer::stop()  {
+// تشغيل الفيديو
+void FFmpegPlayer::play() {
+    playing = true;
+}
+
+// إيقاف مؤقت
+void FFmpegPlayer::pause() {
+    playing = false;
+}
+
+// إيقاف كامل
+void FFmpegPlayer::stop() {
     playing = false;
     seek(0.0);
 }
 
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
-    int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
+
+    int64_t ts = static_cast<int64_t>(seconds * AV_TIME_BASE);
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
+
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
+
     position = seconds;
 }
 
-// ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
@@ -230,7 +241,7 @@ void FFmpegPlayer::_process(double delta) {
     // فك ترميز الإطار التالي
     _decode_next_frame();
 
-    // إذا حصلنا على إطار، نستخدم pts للإطار لتحديث position بدقة
+    // تحديث position بناءً على pts آخر إطار
     if (last_frame_pts >= 0) {
         AVStream *vstream = fmt_ctx->streams[video_stream_idx];
         position = last_frame_pts * av_q2d(vstream->time_base);
@@ -243,10 +254,10 @@ void FFmpegPlayer::_process(double delta) {
         } else {
             playing = false;
             emit_signal("video_finished");
-            return;
         }
     }
 }
+
 // ─── فكّ ترميز الإطار التالي ─────────────────────────────────────────────────
 void FFmpegPlayer::_decode_next_frame() {
     AVPacket *packet = av_packet_alloc();
@@ -259,31 +270,21 @@ void FFmpegPlayer::_decode_next_frame() {
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(video_codec_ctx, frame) == 0) {
-                    // تحديث pts للإطار الحالي
                     last_frame_pts = frame->pts;
 
                     // تحويل الإطار إلى RGB24
-                    av_image_fill_arrays(
-                        rgb->data, rgb->linesize,
-                        frame_buffer,
-                        AV_PIX_FMT_RGB24,
-                        video_width, video_height, 1
-                    );
-                    sws_scale(
-                        sws_ctx,
-                        frame->data, frame->linesize, 0, video_height,
-                        rgb->data,   rgb->linesize
-                    );
+                    av_image_fill_arrays(rgb->data, rgb->linesize, frame_buffer,
+                                         AV_PIX_FMT_RGB24, video_width, video_height, 1);
+                    sws_scale(sws_ctx, frame->data, frame->linesize, 0, video_height,
+                              rgb->data, rgb->linesize);
 
-                    // بناء صورة Godot
                     PackedByteArray pba;
                     int sz = video_width * video_height * 3;
                     pba.resize(sz);
                     memcpy(pba.ptrw(), frame_buffer, sz);
-                    Ref<Image> img = Image::create_from_data(
-                        video_width, video_height, false,
-                        Image::FORMAT_RGB8, pba
-                    );
+
+                    Ref<Image> img = Image::create_from_data(video_width, video_height, false,
+                                                             Image::FORMAT_RGB8, pba);
 
                     if (!current_texture.is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
@@ -299,13 +300,11 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
 
-        // معالجة الصوت: إرسال الحزم الصوتية إلى buffer
+        // معالجة الصوت
         if (packet->stream_index == audio_stream_idx && audio_codec_ctx) {
             avcodec_send_packet(audio_codec_ctx, packet);
             AVFrame *aframe = av_frame_alloc();
             while (avcodec_receive_frame(audio_codec_ctx, aframe) == 0) {
-                // هنا يمكن تعبئة buffer صوتي للإرسال إلى AudioStreamSample
-                // مثال: تحويل aframe->data إلى PackedByteArray وإرسالها عبر signal
                 _push_audio_frame(aframe);
             }
             av_frame_free(&aframe);
@@ -318,9 +317,11 @@ void FFmpegPlayer::_decode_next_frame() {
     av_frame_free(&frame);
     av_frame_free(&rgb);
     av_packet_free(&packet);
+
 }
 void FFmpegPlayer::_push_audio_frame(AVFrame *aframe) {
-    // تحويل الصوت PCM إلى PackedByteArray
+    if (!aframe) return;
+
     int data_size = av_get_bytes_per_sample((AVSampleFormat)aframe->format) *
                     aframe->nb_samples * aframe->channels;
 
@@ -328,7 +329,7 @@ void FFmpegPlayer::_push_audio_frame(AVFrame *aframe) {
     audio_data.resize(data_size);
     memcpy(audio_data.ptrw(), aframe->data[0], data_size);
 
-    // إرسال إلى Godot (signal أو تحديث AudioStreamSample في GDScript)
+    // إرسال البيانات إلى GDScript عبر signal (يمكنك تعريف signal "audio_frame_ready")
     emit_signal("audio_frame_ready", audio_data);
 }
 
