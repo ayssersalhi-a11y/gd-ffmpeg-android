@@ -111,16 +111,11 @@ bool FFmpegPlayer::load_video(const String &path) {
 
     int ret = avformat_open_input(&fmt_ctx, file_path, nullptr, nullptr);
     if (ret < 0) {
-        char err[256]; 
-        av_strerror(ret, err, sizeof(err));
         _emit_video_loaded(false);
-        _emit_playback_error(String("Failed to open file: ") + err);
         return false;
     }
 
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        _emit_video_loaded(false);
-        _emit_playback_error("Failed to read stream info");
         _cleanup();
         return false;
     }
@@ -129,32 +124,19 @@ bool FFmpegPlayer::load_video(const String &path) {
     audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
     if (video_stream_idx < 0) {
-        _emit_video_loaded(false);
-        _emit_playback_error("No video stream found");
         _cleanup();
         return false;
     }
 
     AVStream *vstream = fmt_ctx->streams[video_stream_idx];
     const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
-    if (!vcodec) {
-        _emit_video_loaded(false);
-        _emit_playback_error("Unsupported video codec");
-        _cleanup();
-        return false;
-    }
-
     video_codec_ctx = avcodec_alloc_context3(vcodec);
     avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-    if (avcodec_open2(video_codec_ctx, vcodec, nullptr) < 0) {
-        _emit_video_loaded(false);
-        _emit_playback_error("Failed to open video decoder");
-        _cleanup();
-        return false;
-    }
+    avcodec_open2(video_codec_ctx, vcodec, nullptr);
 
     video_width  = video_codec_ctx->width;
     video_height = video_codec_ctx->height;
+    
     AVRational fr = vstream->r_frame_rate;
     fps = (fr.den > 0) ? (double)fr.num / fr.den : 30.0;
 
@@ -164,21 +146,16 @@ bool FFmpegPlayer::load_video(const String &path) {
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
 
-    int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
-    if (frame_buffer) av_free(frame_buffer);
-    frame_buffer = (uint8_t *)av_malloc(buf_size);
+    // --- استخدام الدالة المساعدة هنا ---
+    _allocate_buffers();
 
     if (audio_stream_idx >= 0) {
-        AVStream *astream = fmt_ctx->streams[audio_stream_idx];
-        _setup_audio(astream);
+        _setup_audio(fmt_ctx->streams[audio_stream_idx]);
     }
 
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
-    
-    // إنشاء التكستشر مسبقاً لمنع خطأ "Not initialized"
-    current_texture.instantiate();
-    
     position = 0.0;
+    
     _emit_video_loaded(true);
     return true;
 }
@@ -243,6 +220,37 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     audio_channels = 2;
     return true;
 }
+void FFmpegPlayer::_allocate_buffers() {
+    if (frame_buffer) {
+        av_free(frame_buffer);
+        frame_buffer = nullptr;
+    }
+
+    int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
+    frame_buffer = (uint8_t *)av_malloc(buf_size);
+    
+    // إعادة تهيئة التكستشر ليتطابق مع الأبعاد الجديدة فوراً
+    if (current_texture.is_valid()) {
+        current_texture.unref(); 
+    }
+    current_texture.instantiate();
+}
+
+void FFmpegPlayer::_clear_audio_buffers() {
+    // تنظيف مكتبة إعادة العينات
+    if (swr_ctx) {
+        swr_close(swr_ctx);
+        swr_init(swr_ctx);
+    }
+    // تنظيف مخزن Godot الصوتي لمنع التكرار أو التأخير
+    if (audio_player) {
+        Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
+        if (playback.is_valid()) {
+            playback->clear();
+        }
+    }
+}
+
 
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
@@ -281,11 +289,12 @@ void FFmpegPlayer::seek(double seconds) {
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
 
-    // النسخة القديمة أعطت دقة أكبر: تنظيف SWR
-    if (swr_ctx) swr_drop_output(swr_ctx, swr_get_delay(swr_ctx, audio_sample_rate));
+    // --- تنظيف الصوت فوراً عند القفز لمنع الضجيج ---
+    _clear_audio_buffers();
 
     position = seconds;
 }
+
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
