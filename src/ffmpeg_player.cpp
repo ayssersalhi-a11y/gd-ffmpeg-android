@@ -275,15 +275,18 @@ void FFmpegPlayer::stop() {
 
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
+
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
+
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
-    // تفريغ بفر SWR
+
+    // النسخة القديمة أعطت دقة أكبر: تنظيف SWR
     if (swr_ctx) swr_drop_output(swr_ctx, swr_get_delay(swr_ctx, audio_sample_rate));
+
     position = seconds;
 }
-
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
@@ -320,20 +323,33 @@ void FFmpegPlayer::_decode_next_frame() {
     while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
 
         // ── فيديو ─────────────────────────────────────────────────────────────
-        if (packet->stream_index == video_stream_idx) {
+void FFmpegPlayer::_decode_next_frame() {
+    AVPacket *packet      = av_packet_alloc();
+    AVFrame  *video_frame = av_frame_alloc();
+    AVFrame  *rgb_frame   = av_frame_alloc();
+    AVFrame  *audio_frame = av_frame_alloc();
+
+    bool got_video = false;
+    int  max_packets = 200; // من النسخة القديمة لمنع التعليق
+
+    while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
+
+        // فيديو
+        if (packet->stream_index == video_stream_idx && video_codec_ctx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
-                while (avcodec_receive_frame(video_codec_ctx, frame) == 0) {
-                    // تحويل الإطار إلى RGB24
+                while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
                     av_image_fill_arrays(
-                        rgb->data, rgb->linesize,
+                        rgb_frame->data, rgb_frame->linesize,
                         frame_buffer,
                         AV_PIX_FMT_RGB24,
                         video_width, video_height, 1
                     );
+
                     sws_scale(
                         sws_ctx,
-                        frame->data, frame->linesize, 0, video_height,
-                        rgb->data,   rgb->linesize
+                        video_frame->data, video_frame->linesize,
+                        0, video_height,
+                        rgb_frame->data, rgb_frame->linesize
                     );
 
                     PackedByteArray pba;
@@ -345,18 +361,23 @@ void FFmpegPlayer::_decode_next_frame() {
                         video_width, video_height, false,
                         Image::FORMAT_RGB8, pba
                     );
-                    current_texture->update(img);
-                    emit_signal("frame_updated", current_texture);
 
-                    av_frame_unref(frame);
+                    if (!current_texture.is_valid()) {
+                        current_texture = ImageTexture::create_from_image(img);
+                    } else {
+                        current_texture->update(img);
+                    }
+
+                    emit_signal("frame_updated", current_texture);
+                    av_frame_unref(video_frame);
                     got_video = true;
                     break;
                 }
             }
         }
 
-        // ── صوت ───────────────────────────────────────────────────────────────
-        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+        // صوت
+        if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
                     _push_audio_samples(audio_frame);
@@ -369,8 +390,8 @@ void FFmpegPlayer::_decode_next_frame() {
     }
 
     av_frame_free(&audio_frame);
-    av_frame_free(&frame);
-    av_frame_free(&rgb);
+    av_frame_free(&video_frame);
+    av_frame_free(&rgb_frame);
     av_packet_free(&packet);
 }
 
@@ -473,6 +494,9 @@ void FFmpegPlayer::_cleanup() {
     duration = position = 0.0;
     video_width = video_height = 0;
     fps = 0.0;
+
+    // تحسين من القديم: التأكد من تحرير الـ Texture
+    current_texture.unref();
 }
 
 // ─── نقطة دخول GDExtension ───────────────────────────────────────────────────
