@@ -35,7 +35,6 @@ namespace godot {
  *   add_child(player)
  *   player.load_video("res://videos/sample.mp4")
  *   player.play()
- *   # اربط إشارة frame_updated بـ TextureRect لعرض الفيديو
  *   player.frame_updated.connect(func(tex): $TextureRect.texture = tex)
  */
 class FFmpegPlayer : public Node {
@@ -69,46 +68,61 @@ public:
     void _ready()               override;
     void _process(double delta) override;
 
+signals:
+    // يُطلق عند تحديث إطار الفيديو، لربطه مباشرة مع TextureRect
+    void frame_updated(Ref<ImageTexture> texture);
+
 protected:
     static void _bind_methods();
 
 private:
     // ── FFmpeg: فيديو ────────────────────────────────────────────────────────
-    AVFormatContext *fmt_ctx;
-    AVCodecContext  *video_codec_ctx;
-    SwsContext      *sws_ctx;
-    int              video_stream_idx;
+    AVFormatContext *fmt_ctx = nullptr;
+    AVCodecContext  *video_codec_ctx = nullptr;
+    SwsContext      *sws_ctx = nullptr;
+    int              video_stream_idx = -1;
 
-    int    video_width;
-    int    video_height;
-    double fps;
+    int    video_width = 0;
+    int    video_height = 0;
+    double fps = 0.0;
 
-    uint8_t           *frame_buffer;
+    uint8_t           *frame_buffer = nullptr;
     Ref<ImageTexture>  current_texture;
 
     // ── FFmpeg: صوت ──────────────────────────────────────────────────────────
-    AVCodecContext *audio_codec_ctx;
-    SwrContext     *swr_ctx;
-    int             audio_stream_idx;
-    int             audio_sample_rate;  // معدل العينات المُخرجة (مطابق للملف)
-    int             audio_channels;     // دائماً 2 (ستيريو) للإخراج
+    AVCodecContext *audio_codec_ctx = nullptr;
+    SwrContext     *swr_ctx = nullptr;
+    int             audio_stream_idx = -1;
+    int             audio_sample_rate = 0;  // معدل العينات
+    int             audio_channels = 2;     // ستيريو دائمًا
 
     // ── Godot Audio ───────────────────────────────────────────────────────────
-    AudioStreamPlayer         *audio_player;
+    AudioStreamPlayer         *audio_player = nullptr;
     Ref<AudioStreamGenerator>  audio_generator;
 
     // ── حالة التشغيل ─────────────────────────────────────────────────────────
-    bool   playing;
-    bool   looping;
-    float  volume;
-    double duration;
-    double position;
+    bool   playing = false;
+    bool   looping = false;
+    float  volume = 1.0f;
+    double duration = 0.0;
+    double position = 0.0;
 
     // ── دوال مساعدة ──────────────────────────────────────────────────────────
+    // تجهيز الصوت وربطه بالملف
     bool _setup_audio(AVStream *astream);
+
+    // فك ترميز الإطار التالي للفيديو
     void _decode_next_frame();
+
+    // تحويل وإرسال عينات الصوت إلى AudioStreamGenerator
     void _push_audio_samples(AVFrame *frame);
+
+    // تنظيف جميع الموارد عند التوقف أو تدمير الكلاس
     void _cleanup();
+
+    // ── مستقبلي: دعم الترجمات أو تأثيرات الفيديو ─────────────────────────────
+    // std::vector<AVSubtitle> subtitles;
+    // SwsFilterContext* filter_ctx;
 };
 
 } // namespace godot
