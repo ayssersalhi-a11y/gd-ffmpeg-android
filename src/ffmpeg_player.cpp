@@ -340,18 +340,24 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 }
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 void FFmpegPlayer::_decode_next_frame() {
+    if (!fmt_ctx || !video_codec_ctx) return;
+
     AVPacket *packet      = av_packet_alloc();
     AVFrame  *video_frame = av_frame_alloc();
     AVFrame  *rgb_frame   = av_frame_alloc();
     AVFrame  *audio_frame = av_frame_alloc();
 
     bool got_video = false;
-    int  max_packets = 100; 
+    int  attempts = 0;
+    const int MAX_ATTEMPTS = 500; // محاولات أكثر لضمان عدم توقف البلاي فجأة
 
-    while (!got_video && max_packets-- > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
-        if (packet->stream_index == video_stream_idx && video_codec_ctx) {
+    while (!got_video && attempts < MAX_ATTEMPTS && av_read_frame(fmt_ctx, packet) >= 0) {
+        attempts++;
+
+        // معالجة الفيديو
+        if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
-                while (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                     sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
 
@@ -362,32 +368,32 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    // --- الإصلاح القاتل للخطأ ---
-                    // نتأكد أولاً أن التكستشر له معرف صالح (RID) في محرك الرسم
                     if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
-                        // إذا كان الحجم متطابقاً، نستخدم set_image لضمان التحديث الآمن
                         current_texture->set_image(img);
                     }
 
                     _emit_frame_updated();
-                    av_frame_unref(video_frame);
                     got_video = true;
-                    break;
+                }
+            }
+        }
+        // معالجة الصوت
+        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+            if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
+                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                    _push_audio_samples(audio_frame);
                 }
             }
         }
 
-        if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
-            if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
-                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                    _push_audio_samples(audio_frame);
-                    av_frame_unref(audio_frame);
-                }
-            }
-        }
         av_packet_unref(packet);
+    }
+
+    // إذا لم نجد فيديو بعد كل هذه المحاولات، قد نكون وصلنا للنهاية
+    if (!got_video && attempts >= MAX_ATTEMPTS) {
+        // لا نفعل شيئاً هنا، الـ _process ستتكفل بالوقت
     }
 
     av_frame_free(&audio_frame);
@@ -395,6 +401,7 @@ void FFmpegPlayer::_decode_next_frame() {
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
 }
+
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
