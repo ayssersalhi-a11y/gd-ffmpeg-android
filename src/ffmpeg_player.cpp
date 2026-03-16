@@ -29,6 +29,7 @@ extern "C" {
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <cstring>
 
 using namespace godot;
 
@@ -186,7 +187,7 @@ bool FFmpegPlayer::load_video(const String &path) {
                ? (double)fmt_ctx->duration / AV_TIME_BASE
                : 0.0;
 
-    current_texture.instantiate();
+    
     position = 0.0;
 
     emit_signal("video_loaded", true);
@@ -306,16 +307,45 @@ float FFmpegPlayer::get_volume() const { return volume; }
 // ─── تنظيف الموارد ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
     playing = false;
-    if (sws_ctx)         { sws_freeContext(sws_ctx);          sws_ctx = nullptr; }
-    if (swr_ctx)         { swr_free(&swr_ctx);                swr_ctx = nullptr; }
-    if (video_codec_ctx) { avcodec_free_context(&video_codec_ctx); }
-    if (audio_codec_ctx) { avcodec_free_context(&audio_codec_ctx); }
-    if (fmt_ctx)         { avformat_close_input(&fmt_ctx); }
-    if (frame_buffer)    { av_free(frame_buffer); frame_buffer = nullptr; }
-    video_stream_idx = audio_stream_idx = -1;
-    duration = position = 0.0;
-    video_width = video_height = 0;
+
+    if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+        sws_ctx = nullptr;
+    }
+
+    if (swr_ctx) {
+        swr_free(&swr_ctx);
+        swr_ctx = nullptr;
+    }
+
+    if (video_codec_ctx) {
+        avcodec_free_context(&video_codec_ctx);
+    }
+
+    if (audio_codec_ctx) {
+        avcodec_free_context(&audio_codec_ctx);
+    }
+
+    if (fmt_ctx) {
+        avformat_close_input(&fmt_ctx);
+    }
+
+    if (frame_buffer) {
+        av_free(frame_buffer);
+        frame_buffer = nullptr;
+    }
+
+    video_stream_idx = -1;
+    audio_stream_idx = -1;
+
+    duration = 0.0;
+    position = 0.0;
+
+    video_width = 0;
+    video_height = 0;
     fps = 0.0;
+
+    current_texture.unref(); // إصلاح خطأ Ref<ImageTexture>
 }
 
 // ─── نقطة دخول GDExtension ───────────────────────────────────────────────────
