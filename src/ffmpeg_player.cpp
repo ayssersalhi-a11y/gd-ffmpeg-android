@@ -239,23 +239,32 @@ void FFmpegPlayer::_process(double delta) {
     static double accumulator = 0.0;
     accumulator += delta;
 
-    double frame_time = 1.0 / fps;
+    double frame_time = (fps > 0) ? 1.0 / fps : 0.04; // افتراضي 25 إطار إذا لم يقرأ الـ fps
 
-    // معالجة "إطارات التعويض" إذا تأخر النظام
+    int frames_decoded_this_tick = 0;
     while (accumulator >= frame_time) {
         _decode_next_frame();
         accumulator -= frame_time;
+        frames_decoded_this_tick++;
+    }
+
+    // برنت مراقبة (سيظهر فقط إذا حدث تأخير كبير في المعالجة)
+    if (frames_decoded_this_tick > 2) {
+        UtilityFunctions::print("[PERF] Lag detected: Decoded ", frames_decoded_this_tick, " frames to catch up.");
     }
 
     if (duration > 0.0 && position >= duration) {
         if (looping) {
+            UtilityFunctions::print("[LOOP] Video finished, seeking to start.");
             seek(0.0);
         } else {
+            UtilityFunctions::print("[STOP] Video reached end.");
             stop();
             _emit_video_finished();
         }
     }
 }
+
 
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     if (!astream || !astream->codecpar) {
@@ -306,16 +315,6 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     audio_channels = 2;
     return true;
 }
-
-double FFmpegPlayer::get_fps() const {
-    UtilityFunctions::print("[GETTER] FPS Requested: ", fps);
-    return fps;
-}
-
-int FFmpegPlayer::get_video_height() const {
-    return video_height;
-}
-
 
 // ── إشارات آمنة ─────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool success) {
@@ -459,7 +458,10 @@ double FFmpegPlayer::get_duration()  const { return duration; }
 double FFmpegPlayer::get_position()  const { return position; }
 int    FFmpegPlayer::get_video_width()  const { return video_width; }
 int    FFmpegPlayer::get_video_height() const { return video_height; }
-double FFmpegPlayer::get_fps()       const { return fps; }
+double FFmpegPlayer::get_fps() const {
+    UtilityFunctions::print("[GETTER] FPS Requested: ", fps);
+    return fps;
+}
 
 Ref<ImageTexture> FFmpegPlayer::get_current_frame_texture() const {
     return current_texture;
