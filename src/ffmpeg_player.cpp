@@ -258,34 +258,26 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
 
+    // تحديث الوقت الفعلي بناءً على الوقت المنقضي في Godot
     position += delta;
     
-    // برنت كل ثانية لمراقبة النبض (Heartbeat)
     static double debug_timer = 0.0;
     debug_timer += delta;
     if (debug_timer >= 1.0) {
-        UtilityFunctions::print("[HEARTBEAT] Position: ", position, " | Playing: ", playing);
+        UtilityFunctions::print("[HEARTBEAT] Time: ", position, "s / ", duration, "s");
         debug_timer = 0.0;
     }
 
-    static double accumulator = 0.0;
-    accumulator += delta;
-
-    double frame_time = (fps > 0) ? 1.0 / fps : 0.04; 
-
-    int frames_decoded = 0;
-    while (accumulator >= frame_time) {
-        _decode_next_frame();
-        accumulator -= frame_time;
-        frames_decoded++;
-        if (frames_decoded > 5) break; 
-    }
+    // هنا السر: سنقوم بفك الإطارات فقط إذا كان وقتها قد حان
+    // لا نحتاج للـ accumulator القديم الآن، سنعتمد على التزامن البسيط
+    _decode_next_frame();
 
     if (duration > 0.0 && position >= duration) {
         if (looping) { seek(0.0); } 
         else { stop(); _emit_video_finished(); }
     }
 }
+
 
 
 
@@ -359,20 +351,26 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
-    if (!fmt_ctx) return;
+    if (!fmt_ctx || !video_codec_ctx) return;
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
     
     bool got_video = false;
-    int packets_read = 0;
 
-    // تقليل الحد الأقصى للحزم لـ 50 بدلاً من 100 لتسريع الاستجابة
-    while (packets_read < 50 && av_read_frame(fmt_ctx, packet) >= 0) {
-        packets_read++;
+    // نقرأ الحزم حتى نجد إطار فيديو وقته يناسب وقتنا الحالي
+    while (av_read_frame(fmt_ctx, packet) >= 0) {
+        if (packet->stream_index == video_stream_idx) {
+            // حساب وقت الإطار الحالي (PTS)
+            double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+            
+            // إذا كان الإطار "في المستقبل"، نتركه للمرة القادمة ونخرج
+            if (frame_pts > position + 0.05) { // هامش 50 ملي ثانية
+                av_packet_unref(packet);
+                break; 
+            }
 
-        if (packet->stream_index == video_stream_idx && !got_video) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
@@ -382,10 +380,14 @@ void FFmpegPlayer::_decode_next_frame() {
                     memcpy(pba.ptrw(), frame_buffer, pba.size());
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                     
-                    if (current_texture.is_valid()) {
+                    // إصلاح خطأ التكستشر: نتحقق من صحة التكستشر قبل التحديث
+                    if (current_texture.is_null()) {
+                        current_texture = ImageTexture::create_from_image(img);
+                    } else {
                         current_texture->update(img);
-                        _emit_frame_updated();
                     }
+
+                    _emit_frame_updated();
                     got_video = true;
                 }
             }
@@ -400,13 +402,14 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
         av_packet_unref(packet);
-        if (got_video && packets_read > 10) break; 
+        if (got_video) break; // وجدنا إطاراً واحداً، نخرج لنعرضه
     }
 
     av_frame_free(&video_frame); 
     av_frame_free(&rgb_frame); 
     av_packet_free(&packet);
 }
+
 
 
 
