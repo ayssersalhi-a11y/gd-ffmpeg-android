@@ -350,25 +350,27 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
     }
 }
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
+
 void FFmpegPlayer::_decode_next_frame() {
     if (!fmt_ctx || !video_codec_ctx) {
-        UtilityFunctions::printerr("[DECODE] ERROR: fmt_ctx or video_codec_ctx is null");
+        UtilityFunctions::printerr("[DECODE] ERROR: Contexts are null");
         return;
     }
 
     AVPacket *packet = av_packet_alloc();
-    if (!packet) return;
-
     AVFrame *video_frame = av_frame_alloc();
-    AVFrame *rgb_frame  = av_frame_alloc();
-    if (!video_frame || !rgb_frame) {
-        av_packet_free(&packet);
+    AVFrame *rgb_frame = av_frame_alloc();
+    
+    if (!packet || !video_frame || !rgb_frame) {
+        if (packet) av_packet_free(&packet);
+        if (video_frame) av_frame_free(&video_frame);
+        if (rgb_frame) av_frame_free(&rgb_frame);
         return;
     }
 
     bool got_video_this_tick = false;
     int packets_checked = 0;
-    const int max_packets_per_tick = 8;   // ← قيمة صغيرة → يمكن زيادتها إلى 12-16 إذا لزم
+    const int max_packets_per_tick = 16; // زدنا القيمة قليلاً لضمان الوصول لحزم الصوت
 
     while (packets_checked < max_packets_per_tick && av_read_frame(fmt_ctx, packet) >= 0) {
         packets_checked++;
@@ -377,66 +379,67 @@ void FFmpegPlayer::_decode_next_frame() {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 int ret = avcodec_receive_frame(video_codec_ctx, video_frame);
                 if (ret == 0) {
-                    UtilityFunctions::print("[VIDEO] Decoded frame | pts=", video_frame->pts,
-                                            " | time=", video_frame->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base));
-
-                    // ── تحويل وتحديث الـ texture (باقي الكود كما هو) ──
+                    // تحويل الإطار إلى RGB
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize,
                                          frame_buffer, AV_PIX_FMT_RGB24,
                                          video_width, video_height, 1);
+                    
                     sws_scale(sws_ctx,
                               video_frame->data, video_frame->linesize, 0, video_height,
                               rgb_frame->data, rgb_frame->linesize);
 
+                    // تحويل البيانات إلى Godot Image
                     PackedByteArray pba;
                     int sz = video_width * video_height * 3;
                     pba.resize(sz);
                     memcpy(pba.ptrw(), frame_buffer, sz);
 
-                    Ref<Image> img = Image::create_from_data(video_width, video_height, false,
-                                                             Image::FORMAT_RGB8, pba);
+                    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
 
-                    if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
+                    // التحقق الذكي من التكستشر لتجنب خطأ الأبعاد (The new image dimensions must match)
+                    if (current_texture.is_null() || 
+                        current_texture->get_width() != video_width || 
+                        current_texture->get_height() != video_height) {
                         current_texture = ImageTexture::create_from_image(img);
+                        UtilityFunctions::print("[VIDEO] Texture Created/Re-initialized: ", video_width, "x", video_height);
                     } else {
                         current_texture->update(img);
                     }
+
                     _emit_frame_updated();
-
                     got_video_this_tick = true;
-
-                    // لا نكمل الحلقة بعد إطار فيديو واحد → نعطي فرصة للصوت والتكات التالية
+                    
+                    UtilityFunctions::print("[VIDEO] Frame Decoded | pts: ", video_frame->pts);
+                    
                     av_packet_unref(packet);
-                    break;
-                } else if (ret == AVERROR(EAGAIN)) {
-                    // تحتاج حزمة أخرى → نستمر
-                } else {
-                    UtilityFunctions::printerr("[VIDEO] receive_frame error: ", ret);
+                    break; // وجدنا إطار فيديو، نخرج لنحافظ على التوقيت
                 }
             }
-        }
+        } 
         else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
-            AVFrame *audio_frame = av_frame_alloc();
+            UtilityFunctions::print("[AUDIO] Audio Packet Found!");
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
+                AVFrame *audio_frame = av_frame_alloc();
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
                     _push_audio_samples(audio_frame);
                 }
+                av_frame_free(&audio_frame);
             }
-            av_frame_free(&audio_frame);
         }
 
         av_packet_unref(packet);
     }
 
-    // تنظيف
+    if (!got_video_this_tick && packets_checked >= max_packets_per_tick) {
+        UtilityFunctions::print("[DECODE] Info: Searched ", packets_checked, " packets without hitting a video frame.");
+    }
+
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
-
-    if (!got_video_this_tick) {
-        UtilityFunctions::print("[DECODE] No new video frame this tick | packets checked: ", packets_checked);
-    }
 }
+
+
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) {
