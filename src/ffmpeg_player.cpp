@@ -96,7 +96,7 @@ void FFmpegPlayer::_ready() {
 }
 
 // ─── تحميل الفيديو ───────────────────────────────────────────────────────────
-bool FFmpegPlayer::load_video(const String &path) {
+
 bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
     UtilityFunctions::print("[LOAD] Opening: ", path);
@@ -114,7 +114,10 @@ bool FFmpegPlayer::load_video(const String &path) {
         return false;
     }
 
-    avformat_find_stream_info(fmt_ctx, nullptr);
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        _cleanup();
+        return false;
+    }
 
     video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
@@ -141,73 +144,15 @@ bool FFmpegPlayer::load_video(const String &path) {
         UtilityFunctions::print("[LOAD] Setting up audio...");
         _setup_audio(fmt_ctx->streams[audio_stream_idx]);
     } else {
-        UtilityFunctions::printerr("[LOAD] NO AUDIO STREAM FOUND IN THIS FILE!");
+        UtilityFunctions::printerr("[LOAD] NO AUDIO STREAM FOUND!");
     }
 
-    duration = (double)fmt_ctx->duration / AV_TIME_BASE;
+    duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
     _emit_video_loaded(true);
     return true;
 }
 
-// ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
-bool FFmpegPlayer::_setup_audio(AVStream *astream) {
-    if (!astream || !astream->codecpar) {
-        _emit_playback_error("Audio stream invalid");
-        return false;
-    }
 
-    const AVCodec *codec = avcodec_find_decoder(astream->codecpar->codec_id);
-    if (!codec) {
-        _emit_playback_error("Audio codec not found");
-        return false;
-    }
-
-    audio_codec_ctx = avcodec_alloc_context3(codec);
-    if (!audio_codec_ctx) {
-        _emit_playback_error("Failed to allocate audio codec context");
-        return false;
-    }
-
-    if (avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar) < 0) {
-        _emit_playback_error("Failed to copy audio codec parameters");
-        return false;
-    }
-
-    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) {
-        _emit_playback_error("Failed to open audio codec");
-        return false;
-    }
-
-    swr_ctx = swr_alloc();
-    
-    AVChannelLayout out_ch_layout;
-    av_channel_layout_default(&out_ch_layout, 2); // Stereo
-
-    av_opt_set_chlayout(swr_ctx, "in_chlayout",  &audio_codec_ctx->ch_layout, 0);
-    av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
-    av_opt_set_int(swr_ctx, "in_sample_rate",    audio_codec_ctx->sample_rate, 0);
-    av_opt_set_int(swr_ctx, "out_sample_rate",   audio_codec_ctx->sample_rate, 0);
-    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  audio_codec_ctx->sample_fmt, 0);
-    av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
-
-    if (swr_init(swr_ctx) < 0) {
-        _emit_playback_error("Failed to initialize audio resampler");
-        return false;
-    }
-
-    // تهيئة الـ Generator وربطه بالمشغل
-    audio_generator.instantiate();
-    audio_generator->set_mix_rate(audio_codec_ctx->sample_rate);
-    audio_generator->set_buffer_length(0.1);
-
-    if (audio_player) {
-        audio_player->set_stream(audio_generator);
-    }
-
-    audio_sample_rate = audio_codec_ctx->sample_rate;
-    audio_channels = 2;
-    return true;
-}
 void FFmpegPlayer::_allocate_buffers() {
     if (frame_buffer) {
         av_free(frame_buffer);
@@ -395,34 +340,58 @@ void FFmpegPlayer::_decode_next_frame() {
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!audio_player) return;
-
-    Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-    if (playback.is_null()) {
-        UtilityFunctions::printerr("[AUDIO] Playback is NULL! Is AudioStreamPlayer playing?");
+    if (!frame || !audio_player) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: Frame or audio_player is null!");
         return;
     }
 
-    int out_samples = swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples;
-    float **converted_data = nullptr;
-    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
+    if (playback.is_null()) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: Playback is NULL! Make sure AudioStreamPlayer is playing.");
+        return;
+    }
 
+    // حساب العينات المتوقعة بعد التحويل (بما في ذلك العينات المتأخرة في الـ Delay)
+    int delay = swr_get_delay(swr_ctx, audio_sample_rate);
+    int out_samples = delay + frame->nb_samples;
+
+    float **converted_data = nullptr;
+    int alloc_ret = av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    
+    if (alloc_ret < 0) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: Could not allocate audio conversion buffer!");
+        return;
+    }
+
+    // عملية التحويل الفعلية
     int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
+        Vector2 *writer = audio_buffer.ptrw();
+
         for (int i = 0; i < converted_count; ++i) {
-            audio_buffer.write[i] = Vector2(converted_data[0][i], converted_data[1][i]);
+            writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
         }
-        
-        int space = playback->get_skips(); // فقط للمراقبة
+
+        // دفع البيانات لـ Godot
         playback->push_buffer(audio_buffer);
-        UtilityFunctions::print("[AUDIO] Pushed ", converted_count, " samples to Godot.");
+        
+        // برنت للمراقبة: يطبع عدد العينات التي دخلت الـ Buffer الآن
+        UtilityFunctions::print("[AUDIO] Success! Pushed Samples: ", converted_count, " | Delay was: ", delay);
+    } else {
+        UtilityFunctions::print("[AUDIO] Warning: swr_convert returned 0 samples.");
     }
 
-    if (converted_data) { av_freep(&converted_data[0]); av_freep(&converted_data); }
+    // تنظيف الذاكرة المؤقتة للتحويل
+    if (converted_data) {
+        av_freep(&converted_data[0]);
+        av_freep(&converted_data);
+    }
 }
+
+
 
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
