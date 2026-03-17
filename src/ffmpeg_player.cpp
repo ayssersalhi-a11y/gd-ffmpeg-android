@@ -236,34 +236,34 @@ void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
 
     position += delta;
+    
+    // برنت كل ثانية لمراقبة النبض (Heartbeat)
+    static double debug_timer = 0.0;
+    debug_timer += delta;
+    if (debug_timer >= 1.0) {
+        UtilityFunctions::print("[HEARTBEAT] Position: ", position, " | Playing: ", playing);
+        debug_timer = 0.0;
+    }
+
     static double accumulator = 0.0;
     accumulator += delta;
 
-    double frame_time = (fps > 0) ? 1.0 / fps : 0.04; // افتراضي 25 إطار إذا لم يقرأ الـ fps
+    double frame_time = (fps > 0) ? 1.0 / fps : 0.04; 
 
-    int frames_decoded_this_tick = 0;
+    int frames_decoded = 0;
     while (accumulator >= frame_time) {
         _decode_next_frame();
         accumulator -= frame_time;
-        frames_decoded_this_tick++;
-    }
-
-    // برنت مراقبة (سيظهر فقط إذا حدث تأخير كبير في المعالجة)
-    if (frames_decoded_this_tick > 2) {
-        UtilityFunctions::print("[PERF] Lag detected: Decoded ", frames_decoded_this_tick, " frames to catch up.");
+        frames_decoded++;
+        if (frames_decoded > 5) break; 
     }
 
     if (duration > 0.0 && position >= duration) {
-        if (looping) {
-            UtilityFunctions::print("[LOOP] Video finished, seeking to start.");
-            seek(0.0);
-        } else {
-            UtilityFunctions::print("[STOP] Video reached end.");
-            stop();
-            _emit_video_finished();
-        }
+        if (looping) { seek(0.0); } 
+        else { stop(); _emit_video_finished(); }
     }
 }
+
 
 
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
@@ -350,10 +350,11 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame *rgb_frame = av_frame_alloc();
     
     bool got_video = false;
-    int packets_processed = 0;
+    int packets_read = 0;
 
-    while (packets_processed < 64 && av_read_frame(fmt_ctx, packet) >= 0) {
-        packets_processed++;
+    // سنحاول قراءة كمية كافية من الحزم
+    while (packets_read < 100 && av_read_frame(fmt_ctx, packet) >= 0) {
+        packets_read++;
 
         if (packet->stream_index == video_stream_idx && !got_video) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
@@ -371,7 +372,8 @@ void FFmpegPlayer::_decode_next_frame() {
                         current_texture->update(img);
 
                     _emit_frame_updated();
-                    got_video = true; 
+                    got_video = true;
+                    // UtilityFunctions::print("[DEBUG] Video Frame Rendered");
                 }
             }
         } 
@@ -381,11 +383,17 @@ void FFmpegPlayer::_decode_next_frame() {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
                     _push_audio_samples(audio_frame);
                 }
-                av_frame_free(&audio_frame); // تحرير الفريم فوراً بعد الدفع
+                av_frame_free(&audio_frame);
             }
         }
         av_packet_unref(packet);
-        if (got_video && packets_processed > 15) break; 
+        
+        // نخرج فقط إذا حصلنا على فيديو وقرأنا بعض الصوت لضمان المزامنة
+        if (got_video && packets_read > 20) break;
+    }
+
+    if (!got_video) {
+        UtilityFunctions::print("[DEBUG] Warning: No video frame found in ", packets_read, " packets.");
     }
 
     av_frame_free(&video_frame); 
@@ -397,30 +405,24 @@ void FFmpegPlayer::_decode_next_frame() {
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: Frame or audio_player is null!");
-        return;
-    }
+    if (!frame || !audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-    if (playback.is_null()) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: Playback is NULL! Make sure AudioStreamPlayer is playing.");
-        return;
+    if (playback.is_null()) return;
+
+    // فحص: إذا كان البفر ممتلئاً في Godot، لا نرسل مزيداً الآن لتجنب التشويش
+    int frames_available = playback->get_frames_available();
+    if (frames_available < frame->nb_samples) {
+        // UtilityFunctions::print("[AUDIO] Buffer Full, skipping samples...");
+        return; 
     }
 
-    // حساب العينات المتوقعة بعد التحويل (بما في ذلك العينات المتأخرة في الـ Delay)
     int delay = swr_get_delay(swr_ctx, audio_sample_rate);
-    int out_samples = delay + frame->nb_samples;
+    int out_samples = av_rescale_rnd(delay + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     float **converted_data = nullptr;
-    int alloc_ret = av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
-    if (alloc_ret < 0) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: Could not allocate audio conversion buffer!");
-        return;
-    }
-
-    // عملية التحويل الفعلية
     int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
@@ -432,21 +434,15 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
             writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
         }
 
-        // دفع البيانات لـ Godot
         playback->push_buffer(audio_buffer);
-        
-        // برنت للمراقبة: يطبع عدد العينات التي دخلت الـ Buffer الآن
-        UtilityFunctions::print("[AUDIO] Success! Pushed Samples: ", converted_count, " | Delay was: ", delay);
-    } else {
-        UtilityFunctions::print("[AUDIO] Warning: swr_convert returned 0 samples.");
     }
 
-    // تنظيف الذاكرة المؤقتة للتحويل
     if (converted_data) {
         av_freep(&converted_data[0]);
         av_freep(&converted_data);
     }
 }
+
 
 
 
