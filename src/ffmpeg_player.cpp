@@ -256,9 +256,9 @@ void FFmpegPlayer::seek(double seconds) {
 
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
-    if (!playing || !fmt_ctx) return;
+    if (!playing || !fmt_ctx || !audio_player) return;
 
-    // تحديث الوقت الفعلي بناءً على الوقت المنقضي في Godot
+    // الاتزان: نزيد الوقت بمقدار الوقت الحقيقي المنقضي
     position += delta;
     
     static double debug_timer = 0.0;
@@ -268,8 +268,7 @@ void FFmpegPlayer::_process(double delta) {
         debug_timer = 0.0;
     }
 
-    // هنا السر: سنقوم بفك الإطارات فقط إذا كان وقتها قد حان
-    // لا نحتاج للـ accumulator القديم الآن، سنعتمد على التزامن البسيط
+    // استدعاء المترجم لمحاولة اللحاق بالوقت الحالي
     _decode_next_frame();
 
     if (duration > 0.0 && position >= duration) {
@@ -277,6 +276,7 @@ void FFmpegPlayer::_process(double delta) {
         else { stop(); _emit_video_finished(); }
     }
 }
+
 
 
 
@@ -369,13 +369,14 @@ void FFmpegPlayer::_decode_next_frame() {
         if (packet->stream_index == video_stream_idx) {
             double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
             
-            // برنت مراقبة المزامنة (كل 60 إطار تقريباً)
+            // برنت مراقبة المزامنة
             static int sync_check = 0;
             if (++sync_check % 60 == 0) {
-                UtilityFunctions::print("[SYNC] Current Pos: ", position, " | Frame PTS: ", frame_pts);
+                UtilityFunctions::print("[SYNC] Pos: ", position, " | Frame PTS: ", frame_pts);
             }
 
-            if (frame_pts > position + 0.05) { 
+            // المكابح: إذا كان الإطار يسبق الوقت الحالي بـ 10 ملي ثانية، نتوقف عن القراءة وننتظر الإطار القادم
+            if (frame_pts > position + 0.01) { 
                 av_packet_unref(packet);
                 break; 
             }
@@ -414,9 +415,8 @@ void FFmpegPlayer::_decode_next_frame() {
         av_packet_unref(packet);
         if (got_video) break;
 
-        // حماية Realme C33: إذا بحثنا في 100 حزمة ولم نجد فيديو، نخرج لنعطي فرصة للنظام
         if (packets_scanned > 100) {
-            UtilityFunctions::print("[VIDEO_WARN] Scanned 100 packets without finding a due video frame.");
+            UtilityFunctions::print("[VIDEO_WARN] Scanned 100 packets without video frame due.");
             break;
         }
     }
@@ -427,6 +427,7 @@ void FFmpegPlayer::_decode_next_frame() {
 }
 
 
+
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) return;
@@ -434,8 +435,11 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) return;
 
+    // الاتزان الحقيقي: إذا كان بفر جودو ممتلئاً (بقي فيه مساحة أقل من حاجتنا)، نتوقف عن الإرسال فوراً
     int frames_available = playback->get_frames_available();
-    if (frames_available < frame->nb_samples) return; 
+    if (frames_available < frame->nb_samples * 2) { 
+        return; 
+    }
 
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
@@ -447,8 +451,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
-        
-        // التصحيح هنا: نستخدم ptrw() للحصول على مؤشر الكتابة
         Vector2 *writer = audio_buffer.ptrw();
         float *f_ptr = (float *)output_buffer;
         
@@ -460,7 +462,7 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         
         static int audio_log_count = 0;
         if (++audio_log_count % 100 == 0) {
-            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Space: ", frames_available);
+            UtilityFunctions::print("[AUDIO_SYNC] Pushed: ", converted_count, " | Buffer Free: ", frames_available);
         }
     }
 
