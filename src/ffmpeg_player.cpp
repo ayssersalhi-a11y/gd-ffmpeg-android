@@ -257,6 +257,65 @@ void FFmpegPlayer::_process(double delta) {
     }
 }
 
+bool FFmpegPlayer::_setup_audio(AVStream *astream) {
+    if (!astream || !astream->codecpar) {
+        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Stream invalid");
+        return false;
+    }
+
+    const AVCodec *codec = avcodec_find_decoder(astream->codecpar->codec_id);
+    if (!codec) {
+        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Codec not found");
+        return false;
+    }
+
+    audio_codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar);
+    
+    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) {
+        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Could not open codec");
+        return false;
+    }
+
+    swr_ctx = swr_alloc();
+    AVChannelLayout out_ch_layout;
+    av_channel_layout_default(&out_ch_layout, 2); // Stereo
+
+    av_opt_set_chlayout(swr_ctx, "in_chlayout",  &audio_codec_ctx->ch_layout, 0);
+    av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate",    audio_codec_ctx->sample_rate, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate",   audio_codec_ctx->sample_rate, 0);
+    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  audio_codec_ctx->sample_fmt, 0);
+    av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+
+    if (swr_init(swr_ctx) < 0) {
+        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Swr init failed");
+        return false;
+    }
+
+    audio_generator.instantiate();
+    audio_generator->set_mix_rate(audio_codec_ctx->sample_rate);
+    audio_generator->set_buffer_length(0.2); // زدنا البفر قليلاً للاستقرار
+
+    if (audio_player) {
+        audio_player->set_stream(audio_generator);
+        UtilityFunctions::print("[AUDIO_SETUP] SUCCESS: Rate=", audio_codec_ctx->sample_rate);
+    }
+
+    audio_sample_rate = audio_codec_ctx->sample_rate;
+    audio_channels = 2;
+    return true;
+}
+
+double FFmpegPlayer::get_fps() const {
+    UtilityFunctions::print("[GETTER] FPS Requested: ", fps);
+    return fps;
+}
+
+int FFmpegPlayer::get_video_height() const {
+    return video_height;
+}
+
 
 // ── إشارات آمنة ─────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool success) {
