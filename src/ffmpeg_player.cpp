@@ -420,11 +420,9 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     int frames_available = playback->get_frames_available();
     if (frames_available < frame->nb_samples) return; 
 
-    // حساب العينات المطلوبة بدقة
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     uint8_t *output_buffer = nullptr;
-    // تخصيص بفر واحد للبيانات المحولة (Stereo FLT تحتاج 8 بايت لكل عينة: 4 لليسار و 4 لليمين)
     av_samples_alloc(&output_buffer, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
     int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
@@ -433,19 +431,19 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
         
-        // تحويل البيانات من النوع float* إلى Vector2 (Godot Style)
+        // التصحيح هنا: نستخدم ptrw() للحصول على مؤشر الكتابة
+        Vector2 *writer = audio_buffer.ptrw();
         float *f_ptr = (float *)output_buffer;
+        
         for (int i = 0; i < converted_count; ++i) {
-            // ملاحظة: AV_SAMPLE_FMT_FLT يضع العينات بشكل (L, R, L, R...)
-            audio_buffer.write[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
+            writer[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
         }
 
         playback->push_buffer(audio_buffer);
         
-        // برنت مراقبة كل 100 حزمة صوت لكي لا نمتلئ بالرسائل
         static int audio_log_count = 0;
         if (++audio_log_count % 100 == 0) {
-            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Buffer space: ", frames_available);
+            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Space: ", frames_available);
         }
     }
 
