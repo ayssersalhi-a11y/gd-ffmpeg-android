@@ -99,7 +99,13 @@ void FFmpegPlayer::_ready() {
 
 bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
-    UtilityFunctions::print("[LOAD] Opening: ", path);
+    
+    if (path.is_empty()) {
+        UtilityFunctions::printerr("[LOAD] Error: Path is empty!");
+        return false;
+    }
+
+    UtilityFunctions::print("[LOAD] Attempting to open: ", path);
 
     if (!audio_player) {
         audio_player = memnew(AudioStreamPlayer);
@@ -107,14 +113,22 @@ bool FFmpegPlayer::load_video(const String &path) {
     }
 
     String real_path = ProjectSettings::get_singleton()->globalize_path(path);
-    int ret = avformat_open_input(&fmt_ctx, real_path.utf8().get_data(), nullptr, nullptr);
+    
+    // تحويل المسار ليكون متوافقاً مع C-Style وتجنب الانهيار
+    CharString utf8_path = real_path.utf8();
+    const char *c_path = utf8_path.get_data();
+
+    int ret = avformat_open_input(&fmt_ctx, c_path, nullptr, nullptr);
     if (ret < 0) {
-        UtilityFunctions::printerr("[LOAD] Failed to open file");
+        char errbuff[512];
+        av_strerror(ret, errbuff, sizeof(errbuff));
+        UtilityFunctions::printerr("[LOAD] FFmpeg Error: ", errbuff);
         _emit_video_loaded(false);
         return false;
     }
 
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        UtilityFunctions::printerr("[LOAD] Could not find stream info");
         _cleanup();
         return false;
     }
@@ -122,52 +136,61 @@ bool FFmpegPlayer::load_video(const String &path) {
     video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
-    UtilityFunctions::print("[LOAD] Video Index: ", video_stream_idx, " | Audio Index: ", audio_stream_idx);
-
     if (video_stream_idx >= 0) {
         AVStream *vstream = fmt_ctx->streams[video_stream_idx];
         const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
-        video_codec_ctx = avcodec_alloc_context3(vcodec);
-        avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-        avcodec_open2(video_codec_ctx, vcodec, nullptr);
-        video_width = video_codec_ctx->width;
-        video_height = video_codec_ctx->height;
-        fps = av_q2d(vstream->r_frame_rate);
-        
-        sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
-                                 video_width, video_height, AV_PIX_FMT_RGB24,
-                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
-        _allocate_buffers();
+        if (vcodec) {
+            video_codec_ctx = avcodec_alloc_context3(vcodec);
+            avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
+            avcodec_open2(video_codec_ctx, vcodec, nullptr);
+            video_width = video_codec_ctx->width;
+            video_height = video_codec_ctx->height;
+            fps = av_q2d(vstream->r_frame_rate);
+            
+            sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
+                                     video_width, video_height, AV_PIX_FMT_RGB24,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+            _allocate_buffers();
+        }
     }
 
     if (audio_stream_idx >= 0) {
-        UtilityFunctions::print("[LOAD] Setting up audio...");
         _setup_audio(fmt_ctx->streams[audio_stream_idx]);
-    } else {
-        UtilityFunctions::printerr("[LOAD] NO AUDIO STREAM FOUND!");
     }
 
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
     _emit_video_loaded(true);
+    UtilityFunctions::print("[LOAD] Success. Duration: ", duration);
     return true;
 }
 
 
+
 void FFmpegPlayer::_allocate_buffers() {
+    // تنظيف البفر القديم فوراً لتحرير الـ RAM في Realme C33
     if (frame_buffer) {
         av_free(frame_buffer);
         frame_buffer = nullptr;
     }
 
+    // حساب الحجم المطلوب للـ RGB24
     int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
     frame_buffer = (uint8_t *)av_malloc(buf_size);
     
-    // إعادة تهيئة التكستشر ليتطابق مع الأبعاد الجديدة فوراً
-    if (current_texture.is_valid()) {
-        current_texture.unref(); 
+    if (!frame_buffer) {
+        UtilityFunctions::printerr("[MEMORY] Critical: Failed to allocate frame buffer!");
+        return;
     }
-    current_texture.instantiate();
+
+    // إعادة تهيئة التكستشر فقط إذا لزم الأمر
+    if (current_texture.is_null()) {
+        current_texture.instantiate();
+        UtilityFunctions::print("[MEMORY] New ImageTexture instantiated.");
+    }
+    
+    UtilityFunctions::print("[MEMORY] Buffers allocated for: ", video_width, "x", video_height);
 }
+
 
 void FFmpegPlayer::_clear_audio_buffers() {
     // تنظيف مكتبة إعادة العينات (FFmpeg Side)
@@ -405,57 +428,39 @@ void FFmpegPlayer::_decode_next_frame() {
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) {
-        UtilityFunctions::printerr("[AUDIO_FATAL] No frame or no player!");
-        return;
-    }
+    if (!frame || !audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-    if (playback.is_null()) {
-        // هذا البرنت سيخبرنا إذا كان الـ AudioStreamPlayer لم يبدأ فعلياً
-        UtilityFunctions::printerr("[AUDIO_FATAL] Playback is NULL. Is the player active?");
-        return;
-    }
+    if (playback.is_null()) return;
 
     int frames_available = playback->get_frames_available();
-    
-    // إذا كان البفر ممتلئاً جداً، نطبع تحذير وننتظر
-    if (frames_available < frame->nb_samples) {
-        UtilityFunctions::print("[AUDIO_WARN] Buffer full. Available: ", frames_available, " Need: ", frame->nb_samples);
-        return; 
-    }
+    if (frames_available <= 0) return; // البفر ممتلئ تماماً، ننتظر التكة القادمة
 
     int delay = swr_get_delay(swr_ctx, audio_sample_rate);
     int out_samples = av_rescale_rnd(delay + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     float **converted_data = nullptr;
-    int alloc_res = av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
-    if (alloc_res < 0) {
-        UtilityFunctions::printerr("[AUDIO_ERROR] Memory allocation failed for conversion!");
-        return;
-    }
-
     int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
+        // دفع فقط ما يتحمله البفر حالياً لتجنب التجمد
+        int to_push = (converted_count < frames_available) ? converted_count : frames_available;
+        
         PackedVector2Array audio_buffer;
-        audio_buffer.resize(converted_count);
+        audio_buffer.resize(to_push);
         Vector2 *writer = audio_buffer.ptrw();
 
-        // فحص "الضجيج": إذا كانت القيم ضخمة جداً، هذا سبب الصوت الحاد
-        bool noise_detected = false;
-        for (int i = 0; i < converted_count; ++i) {
+        for (int i = 0; i < to_push; ++i) {
             writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
-            if (abs(writer[i].x) > 2.0f) noise_detected = true; 
-        }
-
-        if (noise_detected) {
-            UtilityFunctions::print("[AUDIO_DANGER] Distorted samples detected!");
         }
 
         playback->push_buffer(audio_buffer);
-        // UtilityFunctions::print("[AUDIO_FLOW] Pushed: ", converted_count);
+        
+        if (to_push < converted_count) {
+             // UtilityFunctions::print("[AUDIO] Partial push: ", to_push, "/", converted_count);
+        }
     }
 
     if (converted_data) {
