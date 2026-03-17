@@ -290,29 +290,21 @@ void FFmpegPlayer::_process(double delta) {
 
 
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
-    if (!astream || !astream->codecpar) {
-        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Stream invalid");
-        return false;
-    }
+    if (!astream || !astream->codecpar) return false;
 
     const AVCodec *codec = avcodec_find_decoder(astream->codecpar->codec_id);
-    if (!codec) {
-        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Codec not found");
-        return false;
-    }
-
     audio_codec_ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar);
     
-    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) {
-        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Could not open codec");
-        return false;
-    }
+    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) return false;
 
+    if (swr_ctx) swr_free(&swr_ctx);
     swr_ctx = swr_alloc();
+
     AVChannelLayout out_ch_layout;
     av_channel_layout_default(&out_ch_layout, 2); // Stereo
 
+    // إعداد المحول: نأخذ أي صيغة ونحولها إلى FLT (Float 32-bit)
     av_opt_set_chlayout(swr_ctx, "in_chlayout",  &audio_codec_ctx->ch_layout, 0);
     av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
     av_opt_set_int(swr_ctx, "in_sample_rate",    audio_codec_ctx->sample_rate, 0);
@@ -321,23 +313,24 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
     if (swr_init(swr_ctx) < 0) {
-        UtilityFunctions::printerr("[AUDIO_SETUP] ERROR: Swr init failed");
+        UtilityFunctions::printerr("[AUDIO_ERROR] Swr init failed!");
         return false;
     }
 
     audio_generator.instantiate();
     audio_generator->set_mix_rate(audio_codec_ctx->sample_rate);
-    audio_generator->set_buffer_length(0.2); // زدنا البفر قليلاً للاستقرار
+    audio_generator->set_buffer_length(0.5); // زيادة البفر لـ 0.5 ثانية لراحة معالج Realme
 
     if (audio_player) {
         audio_player->set_stream(audio_generator);
-        UtilityFunctions::print("[AUDIO_SETUP] SUCCESS: Rate=", audio_codec_ctx->sample_rate);
+        audio_player->play(); // البدء فوراً لتجهيز الـ Playback
+        UtilityFunctions::print("[AUDIO_DEBUG] Configured: ", audio_codec_ctx->sample_rate, "Hz, Stereo, FLT");
     }
 
     audio_sample_rate = audio_codec_ctx->sample_rate;
-    audio_channels = 2;
     return true;
 }
+
 
 // ── إشارات آمنة ─────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool success) {
@@ -375,8 +368,8 @@ void FFmpegPlayer::_decode_next_frame() {
     bool got_video = false;
     int packets_read = 0;
 
-    // سنحاول قراءة كمية كافية من الحزم
-    while (packets_read < 100 && av_read_frame(fmt_ctx, packet) >= 0) {
+    // تقليل الحد الأقصى للحزم لـ 50 بدلاً من 100 لتسريع الاستجابة
+    while (packets_read < 50 && av_read_frame(fmt_ctx, packet) >= 0) {
         packets_read++;
 
         if (packet->stream_index == video_stream_idx && !got_video) {
@@ -389,14 +382,11 @@ void FFmpegPlayer::_decode_next_frame() {
                     memcpy(pba.ptrw(), frame_buffer, pba.size());
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                     
-                    if (current_texture.is_null() || current_texture->get_width() != video_width) 
-                        current_texture = ImageTexture::create_from_image(img);
-                    else 
+                    if (current_texture.is_valid()) {
                         current_texture->update(img);
-
-                    _emit_frame_updated();
+                        _emit_frame_updated();
+                    }
                     got_video = true;
-                    // UtilityFunctions::print("[DEBUG] Video Frame Rendered");
                 }
             }
         } 
@@ -410,13 +400,7 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
         av_packet_unref(packet);
-        
-        // نخرج فقط إذا حصلنا على فيديو وقرأنا بعض الصوت لضمان المزامنة
-        if (got_video && packets_read > 20) break;
-    }
-
-    if (!got_video) {
-        UtilityFunctions::print("[DEBUG] Warning: No video frame found in ", packets_read, " packets.");
+        if (got_video && packets_read > 10) break; 
     }
 
     av_frame_free(&video_frame); 
@@ -434,39 +418,38 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (playback.is_null()) return;
 
     int frames_available = playback->get_frames_available();
-    if (frames_available <= 0) return; // البفر ممتلئ تماماً، ننتظر التكة القادمة
+    if (frames_available < frame->nb_samples) return; 
 
-    int delay = swr_get_delay(swr_ctx, audio_sample_rate);
-    int out_samples = av_rescale_rnd(delay + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
+    // حساب العينات المطلوبة بدقة
+    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
-    float **converted_data = nullptr;
-    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    uint8_t *output_buffer = nullptr;
+    // تخصيص بفر واحد للبيانات المحولة (Stereo FLT تحتاج 8 بايت لكل عينة: 4 لليسار و 4 لليمين)
+    av_samples_alloc(&output_buffer, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
-    int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
+    int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
-        // دفع فقط ما يتحمله البفر حالياً لتجنب التجمد
-        int to_push = (converted_count < frames_available) ? converted_count : frames_available;
-        
         PackedVector2Array audio_buffer;
-        audio_buffer.resize(to_push);
-        Vector2 *writer = audio_buffer.ptrw();
-
-        for (int i = 0; i < to_push; ++i) {
-            writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
+        audio_buffer.resize(converted_count);
+        
+        // تحويل البيانات من النوع float* إلى Vector2 (Godot Style)
+        float *f_ptr = (float *)output_buffer;
+        for (int i = 0; i < converted_count; ++i) {
+            // ملاحظة: AV_SAMPLE_FMT_FLT يضع العينات بشكل (L, R, L, R...)
+            audio_buffer.write[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
         }
 
         playback->push_buffer(audio_buffer);
         
-        if (to_push < converted_count) {
-             // UtilityFunctions::print("[AUDIO] Partial push: ", to_push, "/", converted_count);
+        // برنت مراقبة كل 100 حزمة صوت لكي لا نمتلئ بالرسائل
+        static int audio_log_count = 0;
+        if (++audio_log_count % 100 == 0) {
+            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Buffer space: ", frames_available);
         }
     }
 
-    if (converted_data) {
-        av_freep(&converted_data[0]);
-        av_freep(&converted_data);
-    }
+    if (output_buffer) av_freep(&output_buffer);
 }
 
 
