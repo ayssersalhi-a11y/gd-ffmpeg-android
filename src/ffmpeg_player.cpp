@@ -405,15 +405,23 @@ void FFmpegPlayer::_decode_next_frame() {
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) return;
+    if (!frame || !audio_player) {
+        UtilityFunctions::printerr("[AUDIO_FATAL] No frame or no player!");
+        return;
+    }
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-    if (playback.is_null()) return;
+    if (playback.is_null()) {
+        // هذا البرنت سيخبرنا إذا كان الـ AudioStreamPlayer لم يبدأ فعلياً
+        UtilityFunctions::printerr("[AUDIO_FATAL] Playback is NULL. Is the player active?");
+        return;
+    }
 
-    // فحص: إذا كان البفر ممتلئاً في Godot، لا نرسل مزيداً الآن لتجنب التشويش
     int frames_available = playback->get_frames_available();
+    
+    // إذا كان البفر ممتلئاً جداً، نطبع تحذير وننتظر
     if (frames_available < frame->nb_samples) {
-        // UtilityFunctions::print("[AUDIO] Buffer Full, skipping samples...");
+        UtilityFunctions::print("[AUDIO_WARN] Buffer full. Available: ", frames_available, " Need: ", frame->nb_samples);
         return; 
     }
 
@@ -421,8 +429,13 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     int out_samples = av_rescale_rnd(delay + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     float **converted_data = nullptr;
-    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
+    int alloc_res = av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
+    if (alloc_res < 0) {
+        UtilityFunctions::printerr("[AUDIO_ERROR] Memory allocation failed for conversion!");
+        return;
+    }
+
     int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
@@ -430,11 +443,19 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         audio_buffer.resize(converted_count);
         Vector2 *writer = audio_buffer.ptrw();
 
+        // فحص "الضجيج": إذا كانت القيم ضخمة جداً، هذا سبب الصوت الحاد
+        bool noise_detected = false;
         for (int i = 0; i < converted_count; ++i) {
             writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
+            if (abs(writer[i].x) > 2.0f) noise_detected = true; 
+        }
+
+        if (noise_detected) {
+            UtilityFunctions::print("[AUDIO_DANGER] Distorted samples detected!");
         }
 
         playback->push_buffer(audio_buffer);
+        // UtilityFunctions::print("[AUDIO_FLOW] Pushed: ", converted_count);
     }
 
     if (converted_data) {
@@ -442,8 +463,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         av_freep(&converted_data);
     }
 }
-
-
 
 
 
