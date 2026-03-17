@@ -452,60 +452,49 @@ void FFmpegPlayer::_decode_next_frame() {
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!frame || !audio_player) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: frame or audio_player is null");
         return;
     }
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: playback is null - AudioStreamGenerator not set");
         return;
     }
 
-    // حساب عدد العينات المتوقعة بعد التحويل (مع الأخذ في الاعتبار التأخير)
-    int delay_samples = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
-    int out_samples_estimate = delay_samples + frame->nb_samples;
+    int delay = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
+    int out_samples = delay + frame->nb_samples;
+
+    UtilityFunctions::print("[AUDIO] Frame received | delay=", delay, " | nb_samples=", frame->nb_samples, " | out_samples=", out_samples);
 
     float **converted_data = nullptr;
     int linesize = 0;
 
-    // تخصيص مصفوفة للعينات المحولة
-    if (av_samples_alloc_array_and_samples(
-            (uint8_t ***)&converted_data,
-            &linesize,
-            audio_channels,
-            out_samples_estimate,
-            AV_SAMPLE_FMT_FLT,
-            32) < 0) {
-        UtilityFunctions::printerr("Failed to allocate audio conversion buffer");
+    if (av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, &linesize, audio_channels, out_samples, AV_SAMPLE_FMT_FLT, 32) < 0) {
+        UtilityFunctions::printerr("[AUDIO] ERROR: failed to allocate conversion buffer");
         return;
     }
 
-    // تحويل العينات
-    int converted_count = swr_convert(
-        swr_ctx,
-        (uint8_t **)converted_data,
-        out_samples_estimate,
-        (const uint8_t **)frame->data,
-        frame->nb_samples
-    );
+    int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples,
+                                      (const uint8_t **)frame->data, frame->nb_samples);
+
+    UtilityFunctions::print("[AUDIO] swr_convert result = ", converted_count, " samples");
 
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
 
-        // نسخ البيانات إلى PackedVector2Array (left → x, right → y)
         auto writer = audio_buffer.ptrw();
         for (int i = 0; i < converted_count; ++i) {
             writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
         }
 
-        // الدفع الجماعي → أكثر كفاءة بكثير من push_frame واحدة تلو الأخرى
         playback->push_buffer(audio_buffer);
-    }
-    else if (converted_count < 0) {
-        UtilityFunctions::printerr("swr_convert failed: ", converted_count);
+        UtilityFunctions::print("[AUDIO] SUCCESS: pushed ", converted_count, " samples to Godot buffer");
+    } else {
+        UtilityFunctions::printerr("[AUDIO] swr_convert FAILED or returned 0");
     }
 
-    // تحرير الذاكرة
     if (converted_data) {
         av_freep(&converted_data[0]);
         av_freep(&converted_data);
