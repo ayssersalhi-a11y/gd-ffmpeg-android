@@ -97,69 +97,57 @@ void FFmpegPlayer::_ready() {
 
 // ─── تحميل الفيديو ───────────────────────────────────────────────────────────
 bool FFmpegPlayer::load_video(const String &path) {
+bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
+    UtilityFunctions::print("[LOAD] Opening: ", path);
 
     if (!audio_player) {
         audio_player = memnew(AudioStreamPlayer);
-        audio_player->set_name("_AudioPlayer");
         add_child(audio_player);
     }
 
     String real_path = ProjectSettings::get_singleton()->globalize_path(path);
-    CharString cs = real_path.utf8();
-    const char *file_path = cs.get_data();
-
-    int ret = avformat_open_input(&fmt_ctx, file_path, nullptr, nullptr);
+    int ret = avformat_open_input(&fmt_ctx, real_path.utf8().get_data(), nullptr, nullptr);
     if (ret < 0) {
+        UtilityFunctions::printerr("[LOAD] Failed to open file");
         _emit_video_loaded(false);
         return false;
     }
 
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        _cleanup();
-        return false;
-    }
+    avformat_find_stream_info(fmt_ctx, nullptr);
 
     video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
-    if (video_stream_idx < 0) {
-        _cleanup();
-        return false;
+    UtilityFunctions::print("[LOAD] Video Index: ", video_stream_idx, " | Audio Index: ", audio_stream_idx);
+
+    if (video_stream_idx >= 0) {
+        AVStream *vstream = fmt_ctx->streams[video_stream_idx];
+        const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
+        video_codec_ctx = avcodec_alloc_context3(vcodec);
+        avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
+        avcodec_open2(video_codec_ctx, vcodec, nullptr);
+        video_width = video_codec_ctx->width;
+        video_height = video_codec_ctx->height;
+        fps = av_q2d(vstream->r_frame_rate);
+        
+        sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
+                                 video_width, video_height, AV_PIX_FMT_RGB24,
+                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
+        _allocate_buffers();
     }
-
-    AVStream *vstream = fmt_ctx->streams[video_stream_idx];
-    const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
-    video_codec_ctx = avcodec_alloc_context3(vcodec);
-    avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-    avcodec_open2(video_codec_ctx, vcodec, nullptr);
-
-    video_width  = video_codec_ctx->width;
-    video_height = video_codec_ctx->height;
-    
-    AVRational fr = vstream->r_frame_rate;
-    fps = (fr.den > 0) ? (double)fr.num / fr.den : 30.0;
-
-    sws_ctx = sws_getContext(
-        video_width, video_height, video_codec_ctx->pix_fmt,
-        video_width, video_height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-
-    // --- استخدام الدالة المساعدة هنا ---
-    _allocate_buffers();
 
     if (audio_stream_idx >= 0) {
+        UtilityFunctions::print("[LOAD] Setting up audio...");
         _setup_audio(fmt_ctx->streams[audio_stream_idx]);
+    } else {
+        UtilityFunctions::printerr("[LOAD] NO AUDIO STREAM FOUND IN THIS FILE!");
     }
 
-    duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
-    position = 0.0;
-    
+    duration = (double)fmt_ctx->duration / AV_TIME_BASE;
     _emit_video_loaded(true);
     return true;
 }
-
 
 // ─── إعداد مفكك ترميز الصوت + SWR + AudioStreamGenerator ─────────────────────
 bool FFmpegPlayer::_setup_audio(AVStream *astream) {
@@ -352,72 +340,43 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
-    if (!fmt_ctx || !video_codec_ctx) {
-        UtilityFunctions::printerr("[DECODE] ERROR: Contexts are null");
-        return;
-    }
+    if (!fmt_ctx) return;
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
     
-    if (!packet || !video_frame || !rgb_frame) {
-        if (packet) av_packet_free(&packet);
-        if (video_frame) av_frame_free(&video_frame);
-        if (rgb_frame) av_frame_free(&rgb_frame);
-        return;
-    }
+    bool got_video = false;
+    int packets_processed = 0;
 
-    bool got_video_this_tick = false;
-    int packets_checked = 0;
-    const int max_packets_per_tick = 16; // زدنا القيمة قليلاً لضمان الوصول لحزم الصوت
+    // سنبحث في 64 حزمة بدلاً من 16 لضمان إيجاد حزم الصوت المختبئة
+    while (packets_processed < 64 && av_read_frame(fmt_ctx, packet) >= 0) {
+        packets_processed++;
 
-    while (packets_checked < max_packets_per_tick && av_read_frame(fmt_ctx, packet) >= 0) {
-        packets_checked++;
-
-        if (packet->stream_index == video_stream_idx) {
+        if (packet->stream_index == video_stream_idx && !got_video) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
-                int ret = avcodec_receive_frame(video_codec_ctx, video_frame);
-                if (ret == 0) {
-                    // تحويل الإطار إلى RGB
-                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize,
-                                         frame_buffer, AV_PIX_FMT_RGB24,
-                                         video_width, video_height, 1);
+                if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                    // (عملية التحويل للتكستشر باختصار)
+                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
+                    sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                     
-                    sws_scale(sws_ctx,
-                              video_frame->data, video_frame->linesize, 0, video_height,
-                              rgb_frame->data, rgb_frame->linesize);
-
-                    // تحويل البيانات إلى Godot Image
-                    PackedByteArray pba;
-                    int sz = video_width * video_height * 3;
-                    pba.resize(sz);
-                    memcpy(pba.ptrw(), frame_buffer, sz);
-
+                    PackedByteArray pba; pba.resize(video_width * video_height * 3);
+                    memcpy(pba.ptrw(), frame_buffer, pba.size());
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-
-                    // التحقق الذكي من التكستشر لتجنب خطأ الأبعاد (The new image dimensions must match)
-                    if (current_texture.is_null() || 
-                        current_texture->get_width() != video_width || 
-                        current_texture->get_height() != video_height) {
+                    
+                    if (current_texture.is_null() || current_texture->get_width() != video_width) 
                         current_texture = ImageTexture::create_from_image(img);
-                        UtilityFunctions::print("[VIDEO] Texture Created/Re-initialized: ", video_width, "x", video_height);
-                    } else {
+                    else 
                         current_texture->update(img);
-                    }
 
                     _emit_frame_updated();
-                    got_video_this_tick = true;
-                    
-                    UtilityFunctions::print("[VIDEO] Frame Decoded | pts: ", video_frame->pts);
-                    
-                    av_packet_unref(packet);
-                    break; // وجدنا إطار فيديو، نخرج لنحافظ على التوقيت
+                    got_video = true; 
+                    // لا نخرج بـ break هنا، لنسمح للحلقة بالتقاط حزم الصوت في نفس "التكة"
                 }
             }
         } 
-        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
-            UtilityFunctions::print("[AUDIO] Audio Packet Found!");
+        else if (packet->stream_index == audio_stream_idx) {
+            UtilityFunctions::print("[DECODE] Audio Packet Read! Size: ", packet->size);
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 AVFrame *audio_frame = av_frame_alloc();
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
@@ -426,71 +385,45 @@ void FFmpegPlayer::_decode_next_frame() {
                 av_frame_free(&audio_frame);
             }
         }
-
         av_packet_unref(packet);
+        if (got_video && packets_processed > 10) break; // توازن بين السرعة والبحث عن الصوت
     }
 
-    if (!got_video_this_tick && packets_checked >= max_packets_per_tick) {
-        UtilityFunctions::print("[DECODE] Info: Searched ", packets_checked, " packets without hitting a video frame.");
-    }
-
-    av_frame_free(&video_frame);
-    av_frame_free(&rgb_frame);
-    av_packet_free(&packet);
+    av_frame_free(&video_frame); av_frame_free(&rgb_frame); av_packet_free(&packet);
 }
 
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: frame or audio_player is null");
-        return;
-    }
+    if (!audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: playback is null - AudioStreamGenerator not set");
+        UtilityFunctions::printerr("[AUDIO] Playback is NULL! Is AudioStreamPlayer playing?");
         return;
     }
 
-    int delay = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
-    int out_samples = delay + frame->nb_samples;
-
-    UtilityFunctions::print("[AUDIO] Frame received | delay=", delay, " | nb_samples=", frame->nb_samples, " | out_samples=", out_samples);
-
+    int out_samples = swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples;
     float **converted_data = nullptr;
-    int linesize = 0;
+    av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
 
-    if (av_samples_alloc_array_and_samples((uint8_t ***)&converted_data, &linesize, audio_channels, out_samples, AV_SAMPLE_FMT_FLT, 32) < 0) {
-        UtilityFunctions::printerr("[AUDIO] ERROR: failed to allocate conversion buffer");
-        return;
-    }
-
-    int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples,
-                                      (const uint8_t **)frame->data, frame->nb_samples);
-
-    UtilityFunctions::print("[AUDIO] swr_convert result = ", converted_count, " samples");
+    int converted_count = swr_convert(swr_ctx, (uint8_t **)converted_data, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
-
-        auto writer = audio_buffer.ptrw();
         for (int i = 0; i < converted_count; ++i) {
-            writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
+            audio_buffer.write[i] = Vector2(converted_data[0][i], converted_data[1][i]);
         }
-
+        
+        int space = playback->get_skips(); // فقط للمراقبة
         playback->push_buffer(audio_buffer);
-        UtilityFunctions::print("[AUDIO] SUCCESS: pushed ", converted_count, " samples to Godot buffer");
-    } else {
-        UtilityFunctions::printerr("[AUDIO] swr_convert FAILED or returned 0");
+        UtilityFunctions::print("[AUDIO] Pushed ", converted_count, " samples to Godot.");
     }
 
-    if (converted_data) {
-        av_freep(&converted_data[0]);
-        av_freep(&converted_data);
-    }
+    if (converted_data) { av_freep(&converted_data[0]); av_freep(&converted_data); }
 }
+
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
 bool   FFmpegPlayer::is_playing()    const { return playing; }
