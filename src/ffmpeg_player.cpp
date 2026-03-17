@@ -352,14 +352,12 @@ void FFmpegPlayer::_decode_next_frame() {
     bool got_video = false;
     int packets_processed = 0;
 
-    // سنبحث في 64 حزمة بدلاً من 16 لضمان إيجاد حزم الصوت المختبئة
     while (packets_processed < 64 && av_read_frame(fmt_ctx, packet) >= 0) {
         packets_processed++;
 
         if (packet->stream_index == video_stream_idx && !got_video) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                    // (عملية التحويل للتكستشر باختصار)
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                     sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                     
@@ -374,26 +372,27 @@ void FFmpegPlayer::_decode_next_frame() {
 
                     _emit_frame_updated();
                     got_video = true; 
-                    // لا نخرج بـ break هنا، لنسمح للحلقة بالتقاط حزم الصوت في نفس "التكة"
                 }
             }
         } 
         else if (packet->stream_index == audio_stream_idx) {
-            UtilityFunctions::print("[DECODE] Audio Packet Read! Size: ", packet->size);
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 AVFrame *audio_frame = av_frame_alloc();
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
                     _push_audio_samples(audio_frame);
                 }
-                av_frame_free(&audio_frame);
+                av_frame_free(&audio_frame); // تحرير الفريم فوراً بعد الدفع
             }
         }
         av_packet_unref(packet);
-        if (got_video && packets_processed > 10) break; // توازن بين السرعة والبحث عن الصوت
+        if (got_video && packets_processed > 15) break; 
     }
 
-    av_frame_free(&video_frame); av_frame_free(&rgb_frame); av_packet_free(&packet);
+    av_frame_free(&video_frame); 
+    av_frame_free(&rgb_frame); 
+    av_packet_free(&packet);
 }
+
 
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
@@ -471,13 +470,15 @@ void FFmpegPlayer::set_loop(bool en)  { looping = en; }
 bool FFmpegPlayer::get_loop()   const { return looping; }
 
 void FFmpegPlayer::set_volume(float v) {
-    volume = CLAMP(v, 0.0f, 2.0f);
+    volume = v; // القيمة تأتي من 0.0 إلى 1.0 أو أكثر
     if (audio_player) {
-        // تحويل linear إلى dB: 0.0→-80 dB، 1.0→0 dB، 2.0→~6 dB
-        float db = (volume <= 0.0f) ? -80.0f : UtilityFunctions::linear_to_db(volume);
+        // Godot يستخدم الـ Decibels، الصفر يعني الصوت الأصلي، والسالب يعني خفض
+        float db = (volume <= 0.0001f) ? -80.0f : 20.0f * log10(volume);
         audio_player->set_volume_db(db);
+        UtilityFunctions::print("[AUDIO] Volume set to: ", volume, " (", db, " dB)");
     }
 }
+
 float FFmpegPlayer::get_volume() const { return volume; }
 
 // ─── تنظيف الموارد ───────────────────────────────────────────────────────────
