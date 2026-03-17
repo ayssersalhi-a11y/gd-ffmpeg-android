@@ -351,22 +351,31 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
-    if (!fmt_ctx || !video_codec_ctx) return;
+    if (!fmt_ctx || !video_codec_ctx) {
+        UtilityFunctions::printerr("[VIDEO_FATAL] Context missing in decoder!");
+        return;
+    }
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
     
     bool got_video = false;
+    int packets_scanned = 0;
 
-    // نقرأ الحزم حتى نجد إطار فيديو وقته يناسب وقتنا الحالي
     while (av_read_frame(fmt_ctx, packet) >= 0) {
+        packets_scanned++;
+
         if (packet->stream_index == video_stream_idx) {
-            // حساب وقت الإطار الحالي (PTS)
             double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
             
-            // إذا كان الإطار "في المستقبل"، نتركه للمرة القادمة ونخرج
-            if (frame_pts > position + 0.05) { // هامش 50 ملي ثانية
+            // برنت مراقبة المزامنة (كل 60 إطار تقريباً)
+            static int sync_check = 0;
+            if (++sync_check % 60 == 0) {
+                UtilityFunctions::print("[SYNC] Current Pos: ", position, " | Frame PTS: ", frame_pts);
+            }
+
+            if (frame_pts > position + 0.05) { 
                 av_packet_unref(packet);
                 break; 
             }
@@ -376,12 +385,13 @@ void FFmpegPlayer::_decode_next_frame() {
                     av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                     sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                     
-                    PackedByteArray pba; pba.resize(video_width * video_height * 3);
+                    PackedByteArray pba; 
+                    pba.resize(video_width * video_height * 3);
                     memcpy(pba.ptrw(), frame_buffer, pba.size());
                     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                     
-                    // إصلاح خطأ التكستشر: نتحقق من صحة التكستشر قبل التحديث
                     if (current_texture.is_null()) {
+                        UtilityFunctions::print("[VIDEO] Initializing Texture: ", video_width, "x", video_height);
                         current_texture = ImageTexture::create_from_image(img);
                     } else {
                         current_texture->update(img);
@@ -402,15 +412,19 @@ void FFmpegPlayer::_decode_next_frame() {
             }
         }
         av_packet_unref(packet);
-        if (got_video) break; // وجدنا إطاراً واحداً، نخرج لنعرضه
+        if (got_video) break;
+
+        // حماية Realme C33: إذا بحثنا في 100 حزمة ولم نجد فيديو، نخرج لنعطي فرصة للنظام
+        if (packets_scanned > 100) {
+            UtilityFunctions::print("[VIDEO_WARN] Scanned 100 packets without finding a due video frame.");
+            break;
+        }
     }
 
     av_frame_free(&video_frame); 
     av_frame_free(&rgb_frame); 
     av_packet_free(&packet);
 }
-
-
 
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
