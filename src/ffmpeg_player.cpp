@@ -351,45 +351,82 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 }
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 void FFmpegPlayer::_decode_next_frame() {
-    if (!fmt_ctx || !video_codec_ctx) return;
+    if (!fmt_ctx || !video_codec_ctx) {
+        return;
+    }
 
     AVPacket *packet = av_packet_alloc();
+    if (!packet) {
+        return;
+    }
+
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
 
-    bool frame_finished = false;
-    int max_retries = 50; // البحث في 50 حزمة كحد أقصى للعثور على فيديو
+    if (!video_frame || !rgb_frame) {
+        av_packet_free(&packet);
+        return;
+    }
 
-    while (!frame_finished && max_retries > 0 && av_read_frame(fmt_ctx, packet) >= 0) {
-        max_retries--;
+    bool video_frame_decoded = false;
+    int retry_count = 0;
+    const int max_retries = 60;  // يمكن تعديله حسب احتياجك
+
+    while (retry_count < max_retries && av_read_frame(fmt_ctx, packet) >= 0) {
+        retry_count++;
 
         if (packet->stream_index == video_stream_idx) {
             if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
                 if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
-                    sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
+                    // تحويل إلى RGB24
+                    av_image_fill_arrays(
+                        rgb_frame->data, rgb_frame->linesize,
+                        frame_buffer, AV_PIX_FMT_RGB24,
+                        video_width, video_height, 1
+                    );
 
+                    sws_scale(
+                        sws_ctx,
+                        video_frame->data, video_frame->linesize, 0, video_height,
+                        rgb_frame->data, rgb_frame->linesize
+                    );
+
+                    // إنشاء/تحديث الـ texture
                     PackedByteArray pba;
-                    int sz = video_width * video_height * 3;
-                    pba.resize(sz);
-                    memcpy(pba.ptrw(), frame_buffer, sz);
+                    int byte_size = video_width * video_height * 3;
+                    pba.resize(byte_size);
+                    memcpy(pba.ptrw(), frame_buffer, byte_size);
 
-                    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+                    Ref<Image> img = Image::create_from_data(
+                        video_width, video_height, false,
+                        Image::FORMAT_RGB8, pba
+                    );
 
                     if (current_texture.is_null() || !current_texture->get_rid().is_valid()) {
                         current_texture = ImageTexture::create_from_image(img);
-                    } else {
-                        if (current_texture->get_width() != video_width || current_texture->get_height() != video_height) {
+                    }
+                    else {
+                        if (current_texture->get_width() != video_width ||
+                            current_texture->get_height() != video_height) {
                             current_texture = ImageTexture::create_from_image(img);
-                        } else {
+                        }
+                        else {
                             current_texture->update(img);
                         }
                     }
+
                     _emit_frame_updated();
-                    frame_finished = true;
+                    video_frame_decoded = true;
+
+                    // ─── مهم جدًا ───
+                    // نخرج بعد أول إطار فيديو ناجح في هذا الـ _process
+                    // لمنع استهلاك كل الحزم دفعة واحدة
+                    av_packet_unref(packet);
+                    break;
                 }
             }
-        } else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
+        }
+        else if (packet->stream_index == audio_stream_idx && audio_codec_ctx && swr_ctx) {
             AVFrame *audio_frame = av_frame_alloc();
             if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
@@ -398,45 +435,82 @@ void FFmpegPlayer::_decode_next_frame() {
             }
             av_frame_free(&audio_frame);
         }
+
         av_packet_unref(packet);
     }
 
+    // تنظيف
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
     av_packet_free(&packet);
+
+    // للتصحيح: يمكنك إزالته لاحقًا
+    if (!video_frame_decoded) {
+        // UtilityFunctions::print("No video frame decoded this tick (normal if audio packets only)");
+    }
 }
-
-
-
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) return;
+    if (!frame || !audio_player) {
+        return;
+    }
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
-    if (!playback.is_valid()) return;
-
-    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
-                                     audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
-
-    float **out = nullptr;
-    av_samples_alloc_array_and_samples((uint8_t ***)&out, nullptr, audio_channels, out_samples, AV_SAMPLE_FMT_FLT, 0);
-    int converted_samples = swr_convert(swr_ctx, (uint8_t**)out, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
-
-    if (converted_samples > 0) {
-        for (int i = 0; i < converted_samples; ++i) {
-            // محاولة دفع الإطار، وإذا كان الـ Buffer ممتلئ، ننتظر قليلاً أو نتخطى بذكاء
-            if (playback->can_push_buffer(1)) {
-                playback->push_frame(Vector2(out[0][i], out[1][i]));
-            }
-        }
+    if (playback.is_null()) {
+        return;
     }
 
-    if (out) {
-        av_freep(&out[0]);
-        av_freep(&out);
+    // حساب عدد العينات المتوقعة بعد التحويل (مع الأخذ في الاعتبار التأخير)
+    int delay_samples = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
+    int out_samples_estimate = delay_samples + frame->nb_samples;
+
+    float **converted_data = nullptr;
+    int linesize = 0;
+
+    // تخصيص مصفوفة للعينات المحولة
+    if (av_samples_alloc_array_and_samples(
+            (uint8_t ***)&converted_data,
+            &linesize,
+            audio_channels,
+            out_samples_estimate,
+            AV_SAMPLE_FMT_FLT,
+            32) < 0) {
+        UtilityFunctions::printerr("Failed to allocate audio conversion buffer");
+        return;
+    }
+
+    // تحويل العينات
+    int converted_count = swr_convert(
+        swr_ctx,
+        (uint8_t **)converted_data,
+        out_samples_estimate,
+        (const uint8_t **)frame->data,
+        frame->nb_samples
+    );
+
+    if (converted_count > 0) {
+        PackedVector2Array audio_buffer;
+        audio_buffer.resize(converted_count);
+
+        // نسخ البيانات إلى PackedVector2Array (left → x, right → y)
+        auto writer = audio_buffer.ptrw();
+        for (int i = 0; i < converted_count; ++i) {
+            writer[i] = Vector2(converted_data[0][i], converted_data[1][i]);
+        }
+
+        // الدفع الجماعي → أكثر كفاءة بكثير من push_frame واحدة تلو الأخرى
+        playback->push_buffer(audio_buffer);
+    }
+    else if (converted_count < 0) {
+        UtilityFunctions::printerr("swr_convert failed: ", converted_count);
+    }
+
+    // تحرير الذاكرة
+    if (converted_data) {
+        av_freep(&converted_data[0]);
+        av_freep(&converted_data);
     }
 }
-
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
 bool   FFmpegPlayer::is_playing()    const { return playing; }
