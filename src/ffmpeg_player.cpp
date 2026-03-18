@@ -477,23 +477,34 @@ void FFmpegPlayer::_decode_next_frame() {
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player) return;
+    // 1. التحقق من الحالة: لا نرسل صوتاً إذا كان المشغل متوقفاً أو الإطار فارغاً
+    if (!playing || !frame || !audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) return;
 
-    // الاتزان الحقيقي: إذا كان بفر جودو ممتلئاً (بقي فيه مساحة أقل من حاجتنا)، نتوقف عن الإرسال فوراً
+    // 2. فحص المساحة المتاحة في بفر جودو (AudioStreamGenerator)
     int frames_available = playback->get_frames_available();
-    if (frames_available < frame->nb_samples * 2) { 
+    
+    // إذا كان البفر ممتلئاً تقريباً، نتوقف لنعطي مجالاً للمعالجة (Realme C33 Safety)
+    if (frames_available < frame->nb_samples) {
+        static int drop_count = 0;
+        if (++drop_count % 100 == 0) {
+            UtilityFunctions::print("[AUDIO_WARN] Buffer full, skipping samples. Available: ", frames_available);
+        }
         return; 
     }
 
-    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
+    // 3. حساب عدد العينات المطلوبة بعد تحويل التردد (Resampling)
+    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, 
+                                     audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     uint8_t *output_buffer = nullptr;
     av_samples_alloc(&output_buffer, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
-    int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
+    // 4. تحويل الصيغة من الملف الأصلي إلى Float 32-bit (المطلوبة في جودو)
+    int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, 
+                                      (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
@@ -501,19 +512,25 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         Vector2 *writer = audio_buffer.ptrw();
         float *f_ptr = (float *)output_buffer;
         
+        // تحويل البيانات إلى تنسيق Vector2 (Left, Right)
         for (int i = 0; i < converted_count; ++i) {
             writer[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
         }
 
+        // 5. دفع البيانات إلى جودو
         playback->push_buffer(audio_buffer);
         
+        // برنت مراقبة التدفق الصوتي كل 200 دفعة
         static int audio_log_count = 0;
-        if (++audio_log_count % 100 == 0) {
-            UtilityFunctions::print("[AUDIO_SYNC] Pushed: ", converted_count, " | Buffer Free: ", frames_available);
+        if (++audio_log_count % 200 == 0) {
+            UtilityFunctions::print("[AUDIO_SYNC] Pushed: ", converted_count, " samples | Buffer space: ", frames_available);
         }
     }
 
-    if (output_buffer) av_freep(&output_buffer);
+    // 6. تنظيف الذاكرة المؤقتة فوراً
+    if (output_buffer) {
+        av_freep(&output_buffer);
+    }
 }
 
 
