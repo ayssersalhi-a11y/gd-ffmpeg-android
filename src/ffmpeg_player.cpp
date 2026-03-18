@@ -403,14 +403,13 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame *rgb_frame = av_frame_alloc();
     bool frame_decoded = false;
 
+    // 1. معالجة الفيديو: فك الحزم حتى نصل للوقت الحالي
     while (!video_packet_queue.empty()) {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // إذا كان الفريم في المستقبل البعيد، ننتظر
         if (frame_pts > position + 0.05) break; 
 
-        // إذا كان الفريم قديماً جداً (تأخير)، نتخطاه للحاق بالصوت
         if (frame_pts < position - 0.1) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
@@ -427,7 +426,9 @@ void FFmpegPlayer::_decode_next_frame() {
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
                 
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-                if (current_texture.is_valid()) current_texture->update(img);
+                if (current_texture.is_valid()) {
+                    current_texture->update(img);
+                }
 
                 _emit_frame_updated();
                 frame_decoded = true;
@@ -438,7 +439,7 @@ void FFmpegPlayer::_decode_next_frame() {
         if (frame_decoded) break; 
     }
 
-    // معالجة الصوت مباشرة
+    // 2. معالجة الصوت: فك الحزم وإرسالها لجودو
     while (!audio_packet_queue.empty()) {
         AVPacket *a_pkt = audio_packet_queue.front();
         if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
@@ -452,12 +453,7 @@ void FFmpegPlayer::_decode_next_frame() {
         av_packet_free(&a_pkt);
     }
 
-    av_frame_free(&video_frame);
-    av_frame_free(&rgb_frame);
-}
-
-
-    // تنظيف الفريمات المخصصة لهذه الدورة (السطر الذي كان به الخطأ)
+    // 3. تنظيف الموارد (الأسطر التي كان بها الخطأ)
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
 }
