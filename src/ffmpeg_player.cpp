@@ -205,12 +205,20 @@ void FFmpegPlayer::_allocate_buffers() {
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
+    
+    // إذا كان متوقفاً تماماً (أول مرة)، نضمن تصفير الوقت
+    if (!playing) {
+        // نضبط الـ position على بداية الملف الحقيقية
+        position = (fmt_ctx->start_time != AV_NOPTS_VALUE) ? (double)fmt_ctx->start_time / AV_TIME_BASE : 0.0;
+        
+        if (audio_player) {
+            audio_player->stop(); // نضمن أنه متوقف ولا يخرج "شوشرة"
+        }
+    }
+
     playing = true;
-    // حذفنا تشغيل الـ audio_player من هنا لنقوم به في الديكودر عند الجاهزية
-    UtilityFunctions::print("[PLAY] Playback started, waiting for buffer...");
+    UtilityFunctions::print("[PLAY] Playback command received. Syncing buffer...");
 }
-
-
 
 void FFmpegPlayer::pause() {
     playing = false;
@@ -385,15 +393,14 @@ void FFmpegPlayer::_clear_audio_buffers() {
     }
     
     if (audio_player) {
-        audio_player->stop(); 
-        // لا نقوم بعمل play هنا أبداً، نترك الـ _decode_next_frame تقرر متى يبدأ
+        audio_player->stop();
+        // خدعة جودو: إعادة تعيين الستريم تمسح البفر الداخلي فوراً
+        audio_player->set_stream(audio_generator); 
     }
     
-    // تصفير عداد الوقت لضمان أن المزامنة ستبدأ من نقطة الصفر الحقيقية
-    position = (fmt_ctx && fmt_ctx->start_time != AV_NOPTS_VALUE) ? (double)fmt_ctx->start_time / AV_TIME_BASE : position;
-    
-    UtilityFunctions::print("[AUDIO] Buffers cleared and ready for fresh start.");
+    UtilityFunctions::print("[AUDIO] Deep clear complete. Buffer is now empty.");
 }
+
 
 
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
@@ -421,7 +428,7 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        if (frame_pts > position + 0.02) break; 
+        if (frame_pts > position + 0.01) break; 
 
         if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
