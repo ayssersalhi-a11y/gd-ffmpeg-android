@@ -242,17 +242,18 @@ void FFmpegPlayer::stop() {
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
 
+    _clear_queues(); // 👈 مسح المخازن فوراً قبل القفز
+
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
 
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
 
-    // --- تنظيف الصوت فوراً عند القفز لمنع الضجيج ---
     _clear_audio_buffers();
-
     position = seconds;
 }
+
 
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
@@ -348,83 +349,129 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
         emit_signal("playback_error", message);
     }
 }
+
+void FFmpegPlayer::_read_packets_to_queue() {
+    if (!fmt_ctx || (video_packet_queue.size() + audio_packet_queue.size()) > MAX_QUEUE_SIZE) return;
+
+    AVPacket *packet = av_packet_alloc();
+    // نقرأ 20 حزمة في كل دورة كحد أقصى لتعبئة المخزن
+    for (int i = 0; i < 20; i++) {
+        if (av_read_frame(fmt_ctx, packet) < 0) {
+            av_packet_free(&packet);
+            break;
+        }
+
+        if (packet->stream_index == video_stream_idx) {
+            video_packet_queue.push_back(av_packet_clone(packet));
+        } else if (packet->stream_index == audio_stream_idx) {
+            audio_packet_queue.push_back(av_packet_clone(packet));
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+}
+
+
+void FFmpegPlayer::_clear_queues() {
+    int v_size = video_packet_queue.size();
+    int a_size = audio_packet_queue.size();
+
+    // تنظيف طابور الفيديو
+    while (!video_packet_queue.empty()) {
+        AVPacket *pkt = video_packet_queue.front();
+        video_packet_queue.pop_front();
+        av_packet_free(&pkt);
+    }
+
+    // تنظيف طابور الصوت
+    while (!audio_packet_queue.empty()) {
+        AVPacket *pkt = audio_packet_queue.front();
+        audio_packet_queue.pop_front();
+        av_packet_free(&pkt);
+    }
+
+    UtilityFunctions::print("[QUEUE_CLEAN] Freed ", v_size, " video and ", a_size, " audio packets.");
+}
+
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
-    if (!fmt_ctx || !video_codec_ctx) {
-        UtilityFunctions::printerr("[VIDEO_FATAL] Context missing in decoder!");
-        return;
-    }
+    _read_packets_to_queue(); // تأكد من وجود حزم في المخزن
 
-    AVPacket *packet = av_packet_alloc();
+    if (video_packet_queue.empty()) return;
+
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
-    
-    bool got_video = false;
-    int packets_scanned = 0;
+    bool frame_shown = false;
 
-    while (av_read_frame(fmt_ctx, packet) >= 0) {
-        packets_scanned++;
+    // فحص أول حزمة في الطابور
+    while (!video_packet_queue.empty()) {
+        AVPacket *packet = video_packet_queue.front();
+        double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        if (packet->stream_index == video_stream_idx) {
-            double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-            
-            // برنت مراقبة المزامنة
-            static int sync_check = 0;
-            if (++sync_check % 60 == 0) {
-                UtilityFunctions::print("[SYNC] Pos: ", position, " | Frame PTS: ", frame_pts);
-            }
+        // 🛑 المكبح الذكي: إذا كانت أول حزمة في المستقبل، توقف فوراً ولا تلمسها
+        if (frame_pts > position + 0.02) { 
+            break; 
+        }
 
-            // المكابح: إذا كان الإطار يسبق الوقت الحالي بـ 10 ملي ثانية، نتوقف عن القراءة وننتظر الإطار القادم
-            if (frame_pts > position + 0.01) { 
-                av_packet_unref(packet);
-                break; 
-            }
+        // إذا كان الإطار قديماً جداً (Dropped Frame)، نحذفه وننتقل للتالي للحاق بالوقت
+        if (frame_pts < position - 0.2) {
+            video_packet_queue.pop_front();
+            av_packet_free(&packet);
+            continue;
+        }
 
-            if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
-                if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
-                    sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
-                    
-                    PackedByteArray pba; 
-                    pba.resize(video_width * video_height * 3);
-                    memcpy(pba.ptrw(), frame_buffer, pba.size());
-                    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-                    
-                    if (current_texture.is_null()) {
-                        UtilityFunctions::print("[VIDEO] Initializing Texture: ", video_width, "x", video_height);
-                        current_texture = ImageTexture::create_from_image(img);
-                    } else {
-                        current_texture->update(img);
-                    }
+        // تفكيك وعرض الحزمة المناسبة للوقت الحالي
+        if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
+            if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
+                sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
+                
+                PackedByteArray pba; 
+                pba.resize(video_width * video_height * 3);
+                memcpy(pba.ptrw(), frame_buffer, pba.size());
+                Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+                
+                if (current_texture.is_valid()) {
+                    current_texture->update(img);
+                } else {
+                    current_texture = ImageTexture::create_from_image(img);
+                }
 
-                    _emit_frame_updated();
-                    got_video = true;
+                _emit_frame_updated();
+                frame_shown = true;
+                
+                // برنت مراقبة المزامنة الجديدة
+                static int sync_log = 0;
+                if (++sync_log % 30 == 0) {
+                    UtilityFunctions::print("[QUEUE_SYNC] Pos: ", position, " | PTS: ", frame_pts, " | Q_Size: ", video_packet_queue.size());
                 }
             }
-        } 
-        else if (packet->stream_index == audio_stream_idx) {
-            if (avcodec_send_packet(audio_codec_ctx, packet) == 0) {
-                AVFrame *audio_frame = av_frame_alloc();
-                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                    _push_audio_samples(audio_frame);
-                }
-                av_frame_free(&audio_frame);
-            }
         }
-        av_packet_unref(packet);
-        if (got_video) break;
 
-        if (packets_scanned > 100) {
-            UtilityFunctions::print("[VIDEO_WARN] Scanned 100 packets without video frame due.");
-            break;
-        }
+        video_packet_queue.pop_front();
+        av_packet_free(&packet);
+        if (frame_shown) break; // عرضنا فريم واحد، اخرج لانتظار الفريم القادم من جودو
     }
 
-    av_frame_free(&video_frame); 
-    av_frame_free(&rgb_frame); 
-    av_packet_free(&packet);
+    // معالجة الصوت من مخزنه الخاص بشكل مستقل
+    while (!audio_packet_queue.empty()) {
+        AVPacket *a_pkt = audio_packet_queue.front();
+        if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+            AVFrame *audio_frame = av_frame_alloc();
+            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                _push_audio_samples(audio_frame);
+            }
+            av_frame_free(&audio_frame);
+        }
+        audio_packet_queue.pop_front();
+        av_packet_free(&a_pkt);
+    }
+
+    av_frame_free(&video_frame);
+    av_frame_free(&rgb_frame);
 }
+
 
 
 
@@ -503,35 +550,14 @@ float FFmpegPlayer::get_volume() const { return volume; }
 
 // ─── تنظيف الموارد ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
-    if (video_codec_ctx) {
-        avcodec_free_context(&video_codec_ctx);
-        video_codec_ctx = nullptr;
-    }
-
-    if (audio_codec_ctx) {
-        avcodec_free_context(&audio_codec_ctx);
-        audio_codec_ctx = nullptr;
-    }
-
-    if (fmt_ctx) {
-        avformat_close_input(&fmt_ctx);
-        fmt_ctx = nullptr;
-    }
-
-    if (sws_ctx) {
-        sws_freeContext(sws_ctx);
-        sws_ctx = nullptr;
-    }
-
-    if (swr_ctx) {
-        swr_free(&swr_ctx);
-        swr_ctx = nullptr;
-    }
-
-    if (frame_buffer) {
-        av_free(frame_buffer);
-        frame_buffer = nullptr;
-    }
+    _clear_queues(); // 👈 تفريغ الحزم العالقة في الذاكرة
+    
+    if (video_codec_ctx) { avcodec_free_context(&video_codec_ctx); video_codec_ctx = nullptr; }
+    if (audio_codec_ctx) { avcodec_free_context(&audio_codec_ctx); audio_codec_ctx = nullptr; }
+    if (fmt_ctx) { avformat_close_input(&fmt_ctx); fmt_ctx = nullptr; }
+    if (sws_ctx) { sws_freeContext(sws_ctx); sws_ctx = nullptr; }
+    if (swr_ctx) { swr_free(&swr_ctx); swr_ctx = nullptr; }
+    if (frame_buffer) { av_free(frame_buffer); frame_buffer = nullptr; }
 }
 
 // ─── نقطة دخول GDExtension ───────────────────────────────────────────────────
