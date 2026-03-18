@@ -206,14 +206,11 @@ void FFmpegPlayer::_allocate_buffers() {
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
     playing = true;
-    if (audio_player && audio_generator.is_valid()) {
-        if (!audio_player->is_playing()) {
-            audio_player->play();
-        } else {
-            audio_player->set_stream_paused(false);
-        }
-    }
+    // حذفنا تشغيل الـ audio_player من هنا لنقوم به في الديكودر عند الجاهزية
+    UtilityFunctions::print("[PLAY] Playback started, waiting for buffer...");
 }
+
+
 
 void FFmpegPlayer::pause() {
     playing = false;
@@ -233,7 +230,8 @@ void FFmpegPlayer::stop() {
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
 
-    _clear_queues(); // 👈 مسح المخازن فوراً قبل القفز
+    if (audio_player) audio_player->stop(); // توقف تام لإعادة المزامنة
+    _clear_queues();
 
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
@@ -244,6 +242,7 @@ void FFmpegPlayer::seek(double seconds) {
     _clear_audio_buffers();
     position = seconds;
 }
+
 
 
 // ─── _process: يُستدعى كل إطار من Godot ─────────────────────────────────────
@@ -407,11 +406,18 @@ void FFmpegPlayer::_clear_audio_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue(); 
 
-    if (video_packet_queue.empty()) {
-        // برنت اختياري إذا أردت مراقبة جفاف الطابور
-        UtilityFunctions::print("[DEBUG] Video queue empty, skipping frame.");
-        return;
+    // --- تعديل المزامنة الأولية ---
+    // إذا كان الفيديو بدأ للتو، انتظر حتى يمتلئ المخزن قليلاً قبل تشغيل الصوت
+    if (playing && audio_player && !audio_player->is_playing()) {
+        if (video_packet_queue.size() > 15) { // انتظر وجود 15 فريم على الأقل
+            audio_player->play();
+            UtilityFunctions::print("[SYNC] Video buffer ready, starting audio now.");
+        } else {
+            return; // انتظر الدورة القادمة
+        }
     }
+
+    if (video_packet_queue.empty()) return;
 
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
@@ -421,56 +427,58 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // 1. مزامنة: إذا كان الفريم في المستقبل، توقف وانتظر الوقت المناسب
+        // المزامنة: إذا كان الفريم في المستقبل البعيد، توقف
         if (frame_pts > position + 0.02) break; 
 
-        // 2. معالجة التأخير (Frame Dropping): إذا كان الفريم قديماً جداً، احذفه للحاق بالوقت
+        // معالجة التأخير: إذا كان الفريم قديماً، تخطاه (هذا ما يسبب القفزة لو بدأ الصوت مبكراً)
         if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
             continue;
         }
 
-        // 3. فك الترميز الفعلي
         if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
             if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                
-                // تحويل الألوان إلى RGB24 (المتوافق مع ImageTexture)
                 av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                 sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                 
-                // نقل البيانات إلى Godot PackedByteArray
                 PackedByteArray pba; 
                 pba.resize(video_width * video_height * 3);
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
-                
-                // إنشاء كائن Image (خفيف جداً هنا)
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                 
-                // التحديث السريع: بما أننا حجزنا التكستشر في _allocate_buffers، نستخدم update فوراً
                 if (current_texture.is_valid()) {
                     current_texture->update(img);
-                } else {
-                    // حماية إضافية في حال نسينا مناداة _allocate_buffers
-                    current_texture = ImageTexture::create_from_image(img);
-                    UtilityFunctions::print("[VIDEO_WARN] Texture was not pre-allocated! Initializing now.");
                 }
-
                 _emit_frame_updated();
                 frame_decoded = true;
-                
-                // برنت مراقبة المزامنة (يظهر كل ثانية تقريباً عند 60fps)
-                static int sync_log = 0;
-                if (++sync_log % 60 == 0) {
-                    UtilityFunctions::print("[VIDEO_SYNC] OK! Pos: ", position, " | PTS: ", frame_pts, " | Queue: ", video_packet_queue.size());
-                }
             }
         }
-
         video_packet_queue.pop_front();
         av_packet_free(&packet);
-        if (frame_decoded) break; 
+        if (frame_decoded) break;
     }
+
+    // معالجة الصوت: لا تبدأ بفك ترميز الصوت إلا إذا كان المشغل يعمل فعلياً
+    if (audio_player && audio_player->is_playing()) {
+        while (!audio_packet_queue.empty()) {
+            AVPacket *a_pkt = audio_packet_queue.front();
+            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+                AVFrame *audio_frame = av_frame_alloc();
+                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                    _push_audio_samples(audio_frame);
+                }
+                av_frame_free(&audio_frame);
+            }
+            audio_packet_queue.pop_front();
+            av_packet_free(&a_pkt);
+        }
+    }
+
+    av_frame_free(&video_frame);
+    av_frame_free(&rgb_frame);
+}
+
 
     // 4. معالجة الصوت المستقلة (لا نلمس منطق الصوت بناءً على طلبك)
     while (!audio_packet_queue.empty()) {
