@@ -269,17 +269,20 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx || !audio_player) return;
 
-    // الاتزان: نزيد الوقت بمقدار الوقت الحقيقي المنقضي
-    position += delta;
+    // القائد الجديد: نأخذ الوقت من مشغل الصوت مباشرة
+    if (audio_player->is_playing()) {
+        position = audio_player->get_playback_position();
+    } else {
+        position += delta; // fallback في حال توقف الصوت
+    }
     
     static double debug_timer = 0.0;
     debug_timer += delta;
     if (debug_timer >= 1.0) {
-        UtilityFunctions::print("[HEARTBEAT] Time: ", position, "s / ", duration, "s");
+        UtilityFunctions::print("[MASTER_CLOCK] Audio Pos: ", position, "s | Buff: ", audio_packet_queue.size());
         debug_timer = 0.0;
     }
 
-    // استدعاء المترجم لمحاولة اللحاق بالوقت الحالي
     _decode_next_frame();
 
     if (duration > 0.0 && position >= duration) {
@@ -287,8 +290,6 @@ void FFmpegPlayer::_process(double delta) {
         else { stop(); _emit_video_finished(); }
     }
 }
-
-
 
 
 
@@ -449,18 +450,15 @@ void FFmpegPlayer::_prefill_buffers() {
 
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
+
 void FFmpegPlayer::_decode_next_frame() {
-    // قراءة حزم جديدة دائماً للحفاظ على تدفق البيانات
     _read_packets_to_queue(); 
 
-    // ─── المرحلة 1: أولوية الصوت القصوى ───
-    // نقوم بمعالجة الصوت "قبل" الفيديو لضمان عدم حدوث فجوات (Audio Gaps)
+    // المرحلة 1: تغذية القائد (الصوت) لضمان عدم توقفه
     if (audio_player && audio_player->is_playing()) {
         int a_processed = 0;
-        // معالجة ما يصل لـ 8 حزم صوتية في كل دورة لضمان استقرار البفر
-        while (!audio_packet_queue.empty() && a_processed < 8) {
+        while (!audio_packet_queue.empty() && a_processed < 10) {
             AVPacket *a_pkt = audio_packet_queue.front();
-            
             if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
                 AVFrame *audio_frame = av_frame_alloc();
                 while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
@@ -468,14 +466,13 @@ void FFmpegPlayer::_decode_next_frame() {
                 }
                 av_frame_free(&audio_frame);
             }
-            
             audio_packet_queue.pop_front();
             av_packet_free(&a_pkt);
             a_processed++;
         }
     }
 
-    // ─── المرحلة 2: معالجة الفيديو ───
+    // المرحلة 2: ملاحقة القائد (الفيديو يتبع الصوت)
     if (video_packet_queue.empty()) return;
 
     AVFrame *video_frame = av_frame_alloc();
@@ -486,11 +483,13 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // إذا كان الفريم أبعد من الوقت الحالي، ننتظر الإطار التالي من جودو
+        // إذا كان الفيديو متقدماً على الصوت بأكثر من 20 ملي ثانية، ننتظر
         if (frame_pts > position + 0.02) break; 
 
-        // إذا كان الفريم قديماً جداً، نتجاهله للحاق بالوقت (Frame Skip)
-        if (frame_pts < position - 0.2) {
+        // إذا كان الفيديو متأخراً عن الصوت بأكثر من 0.1 ثانية، نحذف الفريم للحاق به
+        if (frame_pts < position - 0.1) {
+            static int skip_count = 0;
+            if (++skip_count % 30 == 0) UtilityFunctions::print("[SYNC_WARN] Video lagging! Skipping frames to catch audio...");
             video_packet_queue.pop_front();
             av_packet_free(&packet);
             continue;
@@ -498,7 +497,6 @@ void FFmpegPlayer::_decode_next_frame() {
 
         if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
             if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
-                // تحويل الألوان وتحديث التكستشر
                 av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                 sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                 
@@ -507,46 +505,32 @@ void FFmpegPlayer::_decode_next_frame() {
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
                 
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-                
-                if (current_texture.is_valid()) {
-                    current_texture->update(img);
-                }
+                if (current_texture.is_valid()) current_texture->update(img);
 
                 _emit_frame_updated();
                 frame_decoded = true;
             }
         }
-
         video_packet_queue.pop_front();
         av_packet_free(&packet);
         if (frame_decoded) break; 
     }
-
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
 }
-
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!playing || !frame || !audio_player) return;
-
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) return;
 
     int frames_available = playback->get_frames_available();
-    
-    // التعديل: تصفير الـ Resampler عند البداية لمنع ضوضاء الـ Buffer القديم
-    if (position < 0.1) {
-        swr_close(swr_ctx);
-        swr_init(swr_ctx);
-    }
-
-    // التعديل: إذا كان البفر ممتلئاً بأكثر من 70%، نتوقف مؤقتاً لمنع الـ Glitch
-    // هذا يحمي Realme C33 من الاختناق الصوتي
     int max_buffer = audio_generator->get_buffer_length() * audio_sample_rate;
-    if (frames_available < frame->nb_samples || frames_available < (max_buffer * 0.2)) {
+
+    // إذا كان الخزان ممتلئاً جداً، نتوقف عن الضخ مؤقتاً
+    if (frames_available < frame->nb_samples) {
         return; 
     }
 
@@ -555,30 +539,21 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
 
     uint8_t *output_buffer = nullptr;
     av_samples_alloc(&output_buffer, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
-    
-    int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, 
-                                      (const uint8_t **)frame->data, frame->nb_samples);
+    int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted_count > 0) {
         PackedVector2Array audio_buffer;
         audio_buffer.resize(converted_count);
         Vector2 *writer = audio_buffer.ptrw();
         float *f_ptr = (float *)output_buffer;
-        
         for (int i = 0; i < converted_count; ++i) {
             writer[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
         }
-
         playback->push_buffer(audio_buffer);
-        
-        static int audio_log = 0;
-        if (++audio_log % 300 == 0) {
-            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Space left: ", frames_available);
-        }
     }
-
     if (output_buffer) av_freep(&output_buffer);
 }
+
 
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
