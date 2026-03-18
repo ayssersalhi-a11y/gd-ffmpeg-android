@@ -403,14 +403,13 @@ void FFmpegPlayer::_decode_next_frame() {
     AVFrame *rgb_frame = av_frame_alloc();
     bool frame_decoded = false;
 
-    // 1. معالجة الفيديو: فك الحزم حتى نصل للوقت الحالي
     while (!video_packet_queue.empty()) {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        if (frame_pts > position + 0.05) break; 
+        if (frame_pts > position + 0.02) break; 
 
-        if (frame_pts < position - 0.1) {
+        if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
             continue;
@@ -426,69 +425,77 @@ void FFmpegPlayer::_decode_next_frame() {
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
                 
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+                
                 if (current_texture.is_valid()) {
                     current_texture->update(img);
+                    
+                    // التعديل: لا يبدأ الصوت إلا عند نجاح عرض أول إطار فيديو
+                    if (playing && audio_player && !audio_player->is_playing()) {
+                        UtilityFunctions::print("[SYNC_OK] First frame displayed. Unleashing audio...");
+                        audio_player->play();
+                    }
                 }
 
                 _emit_frame_updated();
                 frame_decoded = true;
             }
         }
+
         video_packet_queue.pop_front();
         av_packet_free(&packet);
         if (frame_decoded) break; 
     }
 
-    // 2. معالجة الصوت: فك الحزم وإرسالها لجودو
-    while (!audio_packet_queue.empty()) {
-        AVPacket *a_pkt = audio_packet_queue.front();
-        if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-            AVFrame *audio_frame = av_frame_alloc();
-            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                _push_audio_samples(audio_frame);
+    // فك رموز الصوت فقط إذا كان المشغل قد انطلق فعلاً
+    if (audio_player && audio_player->is_playing()) {
+        while (!audio_packet_queue.empty()) {
+            AVPacket *a_pkt = audio_packet_queue.front();
+            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+                AVFrame *audio_frame = av_frame_alloc();
+                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                    _push_audio_samples(audio_frame);
+                }
+                av_frame_free(&audio_frame);
             }
-            av_frame_free(&audio_frame);
+            audio_packet_queue.pop_front();
+            av_packet_free(&a_pkt);
         }
-        audio_packet_queue.pop_front();
-        av_packet_free(&a_pkt);
     }
 
-    // 3. تنظيف الموارد (الأسطر التي كان بها الخطأ)
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
 }
 
 
 
-
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    // 1. التحقق من الحالة: لا نرسل صوتاً إذا كان المشغل متوقفاً أو الإطار فارغاً
     if (!playing || !frame || !audio_player) return;
 
     Ref<AudioStreamGeneratorPlayback> playback = audio_player->get_stream_playback();
     if (playback.is_null()) return;
 
-    // 2. فحص المساحة المتاحة في بفر جودو (AudioStreamGenerator)
     int frames_available = playback->get_frames_available();
     
-    // إذا كان البفر ممتلئاً تقريباً، نتوقف لنعطي مجالاً للمعالجة (Realme C33 Safety)
-    if (frames_available < frame->nb_samples) {
-        static int drop_count = 0;
-        if (++drop_count % 100 == 0) {
-            UtilityFunctions::print("[AUDIO_WARN] Buffer full, skipping samples. Available: ", frames_available);
-        }
+    // التعديل: تصفير الـ Resampler عند البداية لمنع ضوضاء الـ Buffer القديم
+    if (position < 0.1) {
+        swr_close(swr_ctx);
+        swr_init(swr_ctx);
+    }
+
+    // التعديل: إذا كان البفر ممتلئاً بأكثر من 70%، نتوقف مؤقتاً لمنع الـ Glitch
+    // هذا يحمي Realme C33 من الاختناق الصوتي
+    int max_buffer = audio_generator->get_buffer_length() * audio_sample_rate;
+    if (frames_available < frame->nb_samples || frames_available < (max_buffer * 0.2)) {
         return; 
     }
 
-    // 3. حساب عدد العينات المطلوبة بعد تحويل التردد (Resampling)
     int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, 
                                      audio_sample_rate, audio_sample_rate, AV_ROUND_UP);
 
     uint8_t *output_buffer = nullptr;
     av_samples_alloc(&output_buffer, nullptr, 2, out_samples, AV_SAMPLE_FMT_FLT, 0);
     
-    // 4. تحويل الصيغة من الملف الأصلي إلى Float 32-bit (المطلوبة في جودو)
     int converted_count = swr_convert(swr_ctx, &output_buffer, out_samples, 
                                       (const uint8_t **)frame->data, frame->nb_samples);
 
@@ -498,25 +505,19 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         Vector2 *writer = audio_buffer.ptrw();
         float *f_ptr = (float *)output_buffer;
         
-        // تحويل البيانات إلى تنسيق Vector2 (Left, Right)
         for (int i = 0; i < converted_count; ++i) {
             writer[i] = Vector2(f_ptr[i * 2], f_ptr[i * 2 + 1]);
         }
 
-        // 5. دفع البيانات إلى جودو
         playback->push_buffer(audio_buffer);
         
-        // برنت مراقبة التدفق الصوتي كل 200 دفعة
-        static int audio_log_count = 0;
-        if (++audio_log_count % 200 == 0) {
-            UtilityFunctions::print("[AUDIO_SYNC] Pushed: ", converted_count, " samples | Buffer space: ", frames_available);
+        static int audio_log = 0;
+        if (++audio_log % 300 == 0) {
+            UtilityFunctions::print("[AUDIO_FLOW] Pushing ", converted_count, " samples. Space left: ", frames_available);
         }
     }
 
-    // 6. تنظيف الذاكرة المؤقتة فوراً
-    if (output_buffer) {
-        av_freep(&output_buffer);
-    }
+    if (output_buffer) av_freep(&output_buffer);
 }
 
 
