@@ -406,14 +406,13 @@ void FFmpegPlayer::_clear_audio_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue(); 
 
-    // --- تعديل المزامنة الأولية ---
-    // إذا كان الفيديو بدأ للتو، انتظر حتى يمتلئ المخزن قليلاً قبل تشغيل الصوت
+    // 1. منطق الانتظار لبناء البفر قبل تشغيل الصوت (حل مشكلة قفزة الصوت)
     if (playing && audio_player && !audio_player->is_playing()) {
-        if (video_packet_queue.size() > 15) { // انتظر وجود 15 فريم على الأقل
+        if (video_packet_queue.size() > 15) {
             audio_player->play();
-            UtilityFunctions::print("[SYNC] Video buffer ready, starting audio now.");
+            UtilityFunctions::print("[SYNC] Buffer ready, audio started.");
         } else {
-            return; // انتظر الدورة القادمة
+            return; 
         }
     }
 
@@ -427,10 +426,8 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // المزامنة: إذا كان الفريم في المستقبل البعيد، توقف
         if (frame_pts > position + 0.02) break; 
 
-        // معالجة التأخير: إذا كان الفريم قديماً، تخطاه (هذا ما يسبب القفزة لو بدأ الصوت مبكراً)
         if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
@@ -445,21 +442,29 @@ void FFmpegPlayer::_decode_next_frame() {
                 PackedByteArray pba; 
                 pba.resize(video_width * video_height * 3);
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
+                
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                 
                 if (current_texture.is_valid()) {
                     current_texture->update(img);
                 }
+
                 _emit_frame_updated();
                 frame_decoded = true;
+                
+                static int sync_log = 0;
+                if (++sync_log % 60 == 0) {
+                    UtilityFunctions::print("[VIDEO_SYNC] Pos: ", position, " | PTS: ", frame_pts);
+                }
             }
         }
+
         video_packet_queue.pop_front();
         av_packet_free(&packet);
-        if (frame_decoded) break;
+        if (frame_decoded) break; 
     }
 
-    // معالجة الصوت: لا تبدأ بفك ترميز الصوت إلا إذا كان المشغل يعمل فعلياً
+    // معالجة الصوت: لا يتم فك رموز الصوت إلا إذا كان المشغل يعمل فعلياً
     if (audio_player && audio_player->is_playing()) {
         while (!audio_packet_queue.empty()) {
             AVPacket *a_pkt = audio_packet_queue.front();
@@ -475,29 +480,10 @@ void FFmpegPlayer::_decode_next_frame() {
         }
     }
 
+    // تنظيف الفريمات المخصصة لهذه الدورة (السطر الذي كان به الخطأ)
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
 }
-
-
-    // 4. معالجة الصوت المستقلة (لا نلمس منطق الصوت بناءً على طلبك)
-    while (!audio_packet_queue.empty()) {
-        AVPacket *a_pkt = audio_packet_queue.front();
-        if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-            AVFrame *audio_frame = av_frame_alloc();
-            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                _push_audio_samples(audio_frame);
-            }
-            av_frame_free(&audio_frame);
-        }
-        audio_packet_queue.pop_front();
-        av_packet_free(&a_pkt);
-    }
-
-    av_frame_free(&video_frame);
-    av_frame_free(&rgb_frame);
-}
-
 
 
 
