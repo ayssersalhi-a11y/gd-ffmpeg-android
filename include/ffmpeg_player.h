@@ -1,6 +1,7 @@
 /**
  * ffmpeg_player.h
  * تعريف كلاس FFmpegPlayer - GDExtension لـ Godot 4
+ * تم التعديل لإضافة نظام Packet Queue والمزامنة الذكية
  */
 
 #pragma once
@@ -13,6 +14,9 @@
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/core/class_db.hpp>
+
+// لإدارة مخزن الحزم
+#include <list>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -62,7 +66,7 @@ protected:
     static void _bind_methods();
 
 private:
-    // ── FFmpeg: فيديو ────────────────────────────────────────────────────────
+    // ── FFmpeg: سياق الملف والفيديو ──────────────────────────────────────────
     AVFormatContext *fmt_ctx = nullptr;
     AVCodecContext  *video_codec_ctx = nullptr;
     SwsContext      *sws_ctx = nullptr;
@@ -75,7 +79,7 @@ private:
     uint8_t           *frame_buffer = nullptr;
     Ref<ImageTexture>  current_texture;
 
-    // ── FFmpeg: صوت ──────────────────────────────────────────────────────────
+    // ── FFmpeg: سياق الصوت ───────────────────────────────────────────────────
     AVCodecContext *audio_codec_ctx = nullptr;
     SwrContext     *swr_ctx = nullptr;
     int             audio_stream_idx = -1;
@@ -86,22 +90,29 @@ private:
     AudioStreamPlayer         *audio_player = nullptr;
     Ref<AudioStreamGenerator>  audio_generator;
 
-    // ── حالة التشغيل ─────────────────────────────────────────────────────────
+    // ── نظام مخزن الحزم (The Queues) ──────────────────────────────────────────
+    std::list<AVPacket*> video_packet_queue;
+    std::list<AVPacket*> audio_packet_queue;
+    const int MAX_QUEUE_SIZE = 120; // سعة تخزين مناسبة لرامات Realme C33
+
+    // ── حالة التشغيل والمزامنة ───────────────────────────────────────────────
     bool   playing = false;
     bool   looping = false;
     float  volume = 1.0f;
     double duration = 0.0;
     double position = 0.0;
 
-    // ── دوال مساعدة داخلية ────────────────────────────────────────────────────
+    // ── دوال مساعدة داخلية (الهيكل الجديد) ─────────────────────────────────────
     bool _setup_audio(AVStream *astream);
-    void _decode_next_frame();
+    void _read_packets_to_queue(); // دالة ملء الخزان
+    void _decode_next_frame();     // دالة التوزيع الذكي
     void _push_audio_samples(AVFrame *frame);
+    void _clear_queues();          // دالة تنظيف المخازن (مهمة للـ Seek)
     void _cleanup();
-    void _allocate_buffers();      // دالة تنظيم الذاكرة
-    void _clear_audio_buffers();   // دالة تنظيف الصوت
+    void _allocate_buffers();      
+    void _clear_audio_buffers();   
 
-    // ── دوال إرسال الإشارات الآمنة ─────────────────────────────────────────────
+    // ── دوال إرسال الإشارات ───────────────────────────────────────────────────
     void _emit_video_loaded(bool success);
     void _emit_video_finished();
     void _emit_frame_updated();
