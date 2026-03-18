@@ -205,20 +205,14 @@ void FFmpegPlayer::_allocate_buffers() {
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
-    
-    // إذا كان متوقفاً تماماً (أول مرة)، نضمن تصفير الوقت
-    if (!playing) {
-        // نضبط الـ position على بداية الملف الحقيقية
-        position = (fmt_ctx->start_time != AV_NOPTS_VALUE) ? (double)fmt_ctx->start_time / AV_TIME_BASE : 0.0;
-        
-        if (audio_player) {
-            audio_player->stop(); // نضمن أنه متوقف ولا يخرج "شوشرة"
-        }
-    }
-
     playing = true;
-    UtilityFunctions::print("[PLAY] Playback command received. Syncing buffer...");
+    if (audio_player) {
+        audio_player->play();
+        audio_player->set_stream_paused(false);
+    }
+    UtilityFunctions::print("[PLAY] Simple start triggered.");
 }
+
 
 void FFmpegPlayer::pause() {
     playing = false;
@@ -257,17 +251,14 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx || !audio_player) return;
 
-    // الاتزان: نزيد الوقت بمقدار الوقت الحقيقي المنقضي
-    position += delta;
-    
-    static double debug_timer = 0.0;
-    debug_timer += delta;
-    if (debug_timer >= 1.0) {
-        UtilityFunctions::print("[HEARTBEAT] Time: ", position, "s / ", duration, "s");
-        debug_timer = 0.0;
+    // المزامنة الذهبية: اجعل الوقت يتبع تشغيل الصوت في جودو
+    if (audio_player->is_playing()) {
+        position = audio_player->get_playback_position();
+    } else {
+        // إذا لم يبدأ الصوت بعد، نزيد الوقت يدوياً بشكل ضئيل جداً لمنع الجمود
+        position += delta;
     }
 
-    // استدعاء المترجم لمحاولة اللحاق بالوقت الحالي
     _decode_next_frame();
 
     if (duration > 0.0 && position >= duration) {
@@ -275,8 +266,6 @@ void FFmpegPlayer::_process(double delta) {
         else { stop(); _emit_video_finished(); }
     }
 }
-
-
 
 
 
@@ -408,16 +397,6 @@ void FFmpegPlayer::_clear_audio_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue(); 
 
-    // 1. منطق الانتظار لبناء البفر قبل تشغيل الصوت (حل مشكلة قفزة الصوت)
-    if (playing && audio_player && !audio_player->is_playing()) {
-        if (video_packet_queue.size() > 15) {
-            audio_player->play();
-            UtilityFunctions::print("[SYNC] Buffer ready, audio started.");
-        } else {
-            return; 
-        }
-    }
-
     if (video_packet_queue.empty()) return;
 
     AVFrame *video_frame = av_frame_alloc();
@@ -428,9 +407,11 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        if (frame_pts > position + 0.01) break; 
+        // إذا كان الفريم في المستقبل البعيد، ننتظر
+        if (frame_pts > position + 0.05) break; 
 
-        if (frame_pts < position - 0.2) {
+        // إذا كان الفريم قديماً جداً (تأخير)، نتخطاه للحاق بالصوت
+        if (frame_pts < position - 0.1) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
             continue;
@@ -446,41 +427,35 @@ void FFmpegPlayer::_decode_next_frame() {
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
                 
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-                
-                if (current_texture.is_valid()) {
-                    current_texture->update(img);
-                }
+                if (current_texture.is_valid()) current_texture->update(img);
 
                 _emit_frame_updated();
                 frame_decoded = true;
-                
-                static int sync_log = 0;
-                if (++sync_log % 60 == 0) {
-                    UtilityFunctions::print("[VIDEO_SYNC] Pos: ", position, " | PTS: ", frame_pts);
-                }
             }
         }
-
         video_packet_queue.pop_front();
         av_packet_free(&packet);
         if (frame_decoded) break; 
     }
 
-    // معالجة الصوت: لا يتم فك رموز الصوت إلا إذا كان المشغل يعمل فعلياً
-    if (audio_player && audio_player->is_playing()) {
-        while (!audio_packet_queue.empty()) {
-            AVPacket *a_pkt = audio_packet_queue.front();
-            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-                AVFrame *audio_frame = av_frame_alloc();
-                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                    _push_audio_samples(audio_frame);
-                }
-                av_frame_free(&audio_frame);
+    // معالجة الصوت مباشرة
+    while (!audio_packet_queue.empty()) {
+        AVPacket *a_pkt = audio_packet_queue.front();
+        if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+            AVFrame *audio_frame = av_frame_alloc();
+            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                _push_audio_samples(audio_frame);
             }
-            audio_packet_queue.pop_front();
-            av_packet_free(&a_pkt);
+            av_frame_free(&audio_frame);
         }
+        audio_packet_queue.pop_front();
+        av_packet_free(&a_pkt);
     }
+
+    av_frame_free(&video_frame);
+    av_frame_free(&rgb_frame);
+}
+
 
     // تنظيف الفريمات المخصصة لهذه الدورة (السطر الذي كان به الخطأ)
     av_frame_free(&video_frame);
