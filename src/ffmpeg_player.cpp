@@ -204,10 +204,30 @@ void FFmpegPlayer::_allocate_buffers() {
 
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
 void FFmpegPlayer::play() {
-    if (!fmt_ctx) return;
+    if (!fmt_ctx) {
+        UtilityFunctions::printerr("[PLAY] Cannot play: Video not loaded.");
+        return;
+    }
+
+    // 1. إذا كنا في بداية الفيديو (أو بعد seek للصفر)، نقوم بالإحماء
+    if (position < 0.5) {
+        UtilityFunctions::print("[PLAY] Initial start detected. Starting prefill...");
+        _prefill_buffers();
+    }
+
+    // 2. تفعيل حالة التشغيل
     playing = true;
-    // حذفنا تشغيل الـ audio_player من هنا لنقوم به في الديكودر عند الجاهزية
-    UtilityFunctions::print("[PLAY] Playback started, waiting for buffer...");
+
+    // 3. تشغيل صوت جودو فوراً لأن البفر أصبح يحتوي على بيانات من الإحماء
+    if (audio_player) {
+        audio_player->set_stream_paused(false);
+        if (!audio_player->is_playing()) {
+            audio_player->play();
+        }
+        UtilityFunctions::print("[PLAY] Audio player engaged.");
+    }
+
+    UtilityFunctions::print("[PLAY] Playback started at position: ", position);
 }
 
 
@@ -395,12 +415,67 @@ void FFmpegPlayer::_clear_audio_buffers() {
     UtilityFunctions::print("[AUDIO] Buffers cleared and ready for fresh start.");
 }
 
+void FFmpegPlayer::_prefill_buffers() {
+    if (!fmt_ctx || !audio_codec_ctx) return;
+
+    UtilityFunctions::print("[PREFILL] Starting buffer warm-up for Realme C33...");
+
+    // 1. ملء طابور الحزم الخام أولاً (قراءة 60 حزمة لضمان وجود مادة للعمل)
+    for (int i = 0; i < 60; i++) {
+        _read_packets_to_queue();
+    }
+
+    // 2. فك تشفير كمية أولية من الصوت لملء بفر جودو قبل انطلاق التوقيت
+    int prefill_count = 0;
+    while (!audio_packet_queue.empty() && prefill_count < 20) {
+        AVPacket *a_pkt = audio_packet_queue.front();
+        
+        if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+            AVFrame *audio_frame = av_frame_alloc();
+            while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                _push_audio_samples(audio_frame);
+            }
+            av_frame_free(&audio_frame);
+        }
+        
+        audio_packet_queue.pop_front();
+        av_packet_free(&a_pkt);
+        prefill_count++;
+    }
+
+    UtilityFunctions::print("[PREFILL] Warm-up finished. Audio packets processed: ", prefill_count);
+}
+
 
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
+    // قراءة حزم جديدة دائماً للحفاظ على تدفق البيانات
     _read_packets_to_queue(); 
 
+    // ─── المرحلة 1: أولوية الصوت القصوى ───
+    // نقوم بمعالجة الصوت "قبل" الفيديو لضمان عدم حدوث فجوات (Audio Gaps)
+    if (audio_player && audio_player->is_playing()) {
+        int a_processed = 0;
+        // معالجة ما يصل لـ 8 حزم صوتية في كل دورة لضمان استقرار البفر
+        while (!audio_packet_queue.empty() && a_processed < 8) {
+            AVPacket *a_pkt = audio_packet_queue.front();
+            
+            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+                AVFrame *audio_frame = av_frame_alloc();
+                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
+                    _push_audio_samples(audio_frame);
+                }
+                av_frame_free(&audio_frame);
+            }
+            
+            audio_packet_queue.pop_front();
+            av_packet_free(&a_pkt);
+            a_processed++;
+        }
+    }
+
+    // ─── المرحلة 2: معالجة الفيديو ───
     if (video_packet_queue.empty()) return;
 
     AVFrame *video_frame = av_frame_alloc();
@@ -411,8 +486,10 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
+        // إذا كان الفريم أبعد من الوقت الحالي، ننتظر الإطار التالي من جودو
         if (frame_pts > position + 0.02) break; 
 
+        // إذا كان الفريم قديماً جداً، نتجاهله للحاق بالوقت (Frame Skip)
         if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
@@ -421,6 +498,7 @@ void FFmpegPlayer::_decode_next_frame() {
 
         if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
             if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                // تحويل الألوان وتحديث التكستشر
                 av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                 sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                 
@@ -432,12 +510,6 @@ void FFmpegPlayer::_decode_next_frame() {
                 
                 if (current_texture.is_valid()) {
                     current_texture->update(img);
-                    
-                    // التعديل: لا يبدأ الصوت إلا عند نجاح عرض أول إطار فيديو
-                    if (playing && audio_player && !audio_player->is_playing()) {
-                        UtilityFunctions::print("[SYNC_OK] First frame displayed. Unleashing audio...");
-                        audio_player->play();
-                    }
                 }
 
                 _emit_frame_updated();
@@ -448,22 +520,6 @@ void FFmpegPlayer::_decode_next_frame() {
         video_packet_queue.pop_front();
         av_packet_free(&packet);
         if (frame_decoded) break; 
-    }
-
-    // فك رموز الصوت فقط إذا كان المشغل قد انطلق فعلاً
-    if (audio_player && audio_player->is_playing()) {
-        while (!audio_packet_queue.empty()) {
-            AVPacket *a_pkt = audio_packet_queue.front();
-            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-                AVFrame *audio_frame = av_frame_alloc();
-                while (avcodec_receive_frame(audio_codec_ctx, audio_frame) == 0) {
-                    _push_audio_samples(audio_frame);
-                }
-                av_frame_free(&audio_frame);
-            }
-            audio_packet_queue.pop_front();
-            av_packet_free(&a_pkt);
-        }
     }
 
     av_frame_free(&video_frame);
