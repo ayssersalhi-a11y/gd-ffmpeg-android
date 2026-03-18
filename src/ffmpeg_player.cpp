@@ -206,12 +206,10 @@ void FFmpegPlayer::_allocate_buffers() {
 void FFmpegPlayer::play() {
     if (!fmt_ctx) return;
     playing = true;
-    if (audio_player) {
-        audio_player->play();
-        audio_player->set_stream_paused(false);
-    }
-    UtilityFunctions::print("[PLAY] Simple start triggered.");
+    // حذفنا تشغيل الـ audio_player من هنا لنقوم به في الديكودر عند الجاهزية
+    UtilityFunctions::print("[PLAY] Playback started, waiting for buffer...");
 }
+
 
 
 void FFmpegPlayer::pause() {
@@ -251,14 +249,17 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx || !audio_player) return;
 
-    // المزامنة الذهبية: اجعل الوقت يتبع تشغيل الصوت في جودو
-    if (audio_player->is_playing()) {
-        position = audio_player->get_playback_position();
-    } else {
-        // إذا لم يبدأ الصوت بعد، نزيد الوقت يدوياً بشكل ضئيل جداً لمنع الجمود
-        position += delta;
+    // الاتزان: نزيد الوقت بمقدار الوقت الحقيقي المنقضي
+    position += delta;
+    
+    static double debug_timer = 0.0;
+    debug_timer += delta;
+    if (debug_timer >= 1.0) {
+        UtilityFunctions::print("[HEARTBEAT] Time: ", position, "s / ", duration, "s");
+        debug_timer = 0.0;
     }
 
+    // استدعاء المترجم لمحاولة اللحاق بالوقت الحالي
     _decode_next_frame();
 
     if (duration > 0.0 && position >= duration) {
@@ -266,6 +267,8 @@ void FFmpegPlayer::_process(double delta) {
         else { stop(); _emit_video_finished(); }
     }
 }
+
+
 
 
 
@@ -382,14 +385,15 @@ void FFmpegPlayer::_clear_audio_buffers() {
     }
     
     if (audio_player) {
-        audio_player->stop();
-        // خدعة جودو: إعادة تعيين الستريم تمسح البفر الداخلي فوراً
-        audio_player->set_stream(audio_generator); 
+        audio_player->stop(); 
+        // لا نقوم بعمل play هنا أبداً، نترك الـ _decode_next_frame تقرر متى يبدأ
     }
     
-    UtilityFunctions::print("[AUDIO] Deep clear complete. Buffer is now empty.");
+    // تصفير عداد الوقت لضمان أن المزامنة ستبدأ من نقطة الصفر الحقيقية
+    position = (fmt_ctx && fmt_ctx->start_time != AV_NOPTS_VALUE) ? (double)fmt_ctx->start_time / AV_TIME_BASE : position;
+    
+    UtilityFunctions::print("[AUDIO] Buffers cleared and ready for fresh start.");
 }
-
 
 
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
@@ -467,8 +471,8 @@ void FFmpegPlayer::_decode_next_frame() {
 }
 
 
-
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
+
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!playing || !frame || !audio_player) return;
 
@@ -519,7 +523,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
 
     if (output_buffer) av_freep(&output_buffer);
 }
-
 
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
