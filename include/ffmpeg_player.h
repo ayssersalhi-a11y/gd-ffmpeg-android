@@ -1,7 +1,7 @@
 /**
  * ffmpeg_player.h
  * تعريف كلاس FFmpegPlayer - GDExtension لـ Godot 4
- * تم التعديل لإضافة نظام Packet Queue والمزامنة الذكية
+ * تم التعديل لإضافة نظام Prefill والمزامنة المتقدمة لـ Realme C33
  */
 
 #pragma once
@@ -15,7 +15,7 @@
 #include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/core/class_db.hpp>
 
-// لإدارة مخزن الحزم
+// لإدارة مخزن الحزم (Queues)
 #include <list>
 
 extern "C" {
@@ -102,12 +102,13 @@ private:
     double duration = 0.0;
     double position = 0.0;
 
-    // ── دوال مساعدة داخلية (الهيكل الجديد) ─────────────────────────────────────
+    // ── دوال مساعدة داخلية ────────────────────────────────────────────────────
     bool _setup_audio(AVStream *astream);
-    void _read_packets_to_queue(); // دالة ملء الخزان
-    void _decode_next_frame();     // دالة التوزيع الذكي
+    void _read_packets_to_queue(); // دالة ملء الخزان الخام
+    void _prefill_buffers();      // 👈 دالة الإحماء الجديدة: تملأ البفر قبل الانطلاق
+    void _decode_next_frame();     // دالة التوزيع الذكي (أولوية للصوت)
     void _push_audio_samples(AVFrame *frame);
-    void _clear_queues();          // دالة تنظيف المخازن (مهمة للـ Seek)
+    void _clear_queues();          // تنظيف المخازن عند الـ Seek أو الإيقاف
     void _cleanup();
     void _allocate_buffers();      
     void _clear_audio_buffers();   
