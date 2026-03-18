@@ -167,13 +167,13 @@ bool FFmpegPlayer::load_video(const String &path) {
 
 
 void FFmpegPlayer::_allocate_buffers() {
-    // تنظيف البفر القديم فوراً لتحرير الـ RAM في Realme C33
+    // 1. تنظيف الذاكرة القديمة (RAM) لمنع التسريب في Realme C33
     if (frame_buffer) {
         av_free(frame_buffer);
         frame_buffer = nullptr;
     }
 
-    // حساب الحجم المطلوب للـ RGB24
+    // 2. حجز بفر جديد لبيانات الـ RGB24 الخام
     int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, video_width, video_height, 1);
     frame_buffer = (uint8_t *)av_malloc(buf_size);
     
@@ -182,33 +182,24 @@ void FFmpegPlayer::_allocate_buffers() {
         return;
     }
 
-    // إعادة تهيئة التكستشر فقط إذا لزم الأمر
+    // 3. تهيئة الصورة السوداء الأولية (Dummy Image)
+    PackedByteArray black_data;
+    black_data.resize(video_width * video_height * 3);
+    black_data.fill(0); // تعبئة باللون الأسود
+
+    Ref<Image> temp_img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, black_data);
+
+    // 4. تهيئة التكستشر وحجزه في الـ GPU
     if (current_texture.is_null()) {
         current_texture.instantiate();
-        UtilityFunctions::print("[MEMORY] New ImageTexture instantiated.");
     }
     
-    UtilityFunctions::print("[MEMORY] Buffers allocated for: ", video_width, "x", video_height);
-}
-
-
-void FFmpegPlayer::_clear_audio_buffers() {
-    // تنظيف مكتبة إعادة العينات (FFmpeg Side)
-    if (swr_ctx) {
-        swr_close(swr_ctx);
-        swr_init(swr_ctx);
-    }
+    // المفتاح السحري: set_image تقوم بعمل Initialize للـ TextureResource
+    current_texture->set_image(temp_img);
     
-    // تنظيف مخزن Godot الصوتي (Godot Side)
-    // بما أن دالة clear() غير مدعومة، نقوم بإيقاف وتشغيل المشغل لتفريغ الـ Buffer داخلياً
-    if (audio_player) {
-        bool was_playing = playing;
-        audio_player->stop(); 
-        if (was_playing) {
-            audio_player->play();
-        }
-    }
+    UtilityFunctions::print("[MEMORY] Buffers allocated and Texture initialized: ", video_width, "x", video_height);
 }
+
 
 
 // ─── تشغيل / إيقاف / توقف ─────────────────────────────────────────────────
@@ -396,65 +387,64 @@ void FFmpegPlayer::_clear_queues() {
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
 void FFmpegPlayer::_decode_next_frame() {
-    _read_packets_to_queue(); // تأكد من وجود حزم في المخزن
+    _read_packets_to_queue(); 
 
     if (video_packet_queue.empty()) return;
 
     AVFrame *video_frame = av_frame_alloc();
     AVFrame *rgb_frame = av_frame_alloc();
-    bool frame_shown = false;
+    bool frame_decoded = false;
 
-    // فحص أول حزمة في الطابور
     while (!video_packet_queue.empty()) {
         AVPacket *packet = video_packet_queue.front();
         double frame_pts = packet->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // 🛑 المكبح الذكي: إذا كانت أول حزمة في المستقبل، توقف فوراً ولا تلمسها
-        if (frame_pts > position + 0.02) { 
-            break; 
-        }
+        if (frame_pts > position + 0.02) break; 
 
-        // إذا كان الإطار قديماً جداً (Dropped Frame)، نحذفه وننتقل للتالي للحاق بالوقت
         if (frame_pts < position - 0.2) {
             video_packet_queue.pop_front();
             av_packet_free(&packet);
             continue;
         }
 
-        // تفكيك وعرض الحزمة المناسبة للوقت الحالي
         if (avcodec_send_packet(video_codec_ctx, packet) == 0) {
             if (avcodec_receive_frame(video_codec_ctx, video_frame) == 0) {
+                // 1. تحويل الفريم إلى RGB24
                 av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
                 sws_scale(sws_ctx, video_frame->data, video_frame->linesize, 0, video_height, rgb_frame->data, rgb_frame->linesize);
                 
+                // 2. تجهيز البيانات لـ Godot
                 PackedByteArray pba; 
                 pba.resize(video_width * video_height * 3);
                 memcpy(pba.ptrw(), frame_buffer, pba.size());
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                 
-                if (current_texture.is_valid()) {
-                    current_texture->update(img);
-                } else {
+                // 3. الحل الجذري لمشكلة Initialization
+                if (current_texture.is_null()) {
+                    // أول فريم: يجب إنشاؤه من الصورة مباشرة لتهيئته في الـ GPU
                     current_texture = ImageTexture::create_from_image(img);
+                    UtilityFunctions::print("[VIDEO_DEBUG] First frame: Texture Initialized (", video_width, "x", video_height, ")");
+                } else {
+                    // الأطر التالية: تحديث التكستشر الموجود فعلياً
+                    current_texture->update(img);
                 }
 
                 _emit_frame_updated();
-                frame_shown = true;
+                frame_decoded = true;
                 
-                // برنت مراقبة المزامنة الجديدة
                 static int sync_log = 0;
-                if (++sync_log % 30 == 0) {
-                    UtilityFunctions::print("[QUEUE_SYNC] Pos: ", position, " | PTS: ", frame_pts, " | Q_Size: ", video_packet_queue.size());
+                if (++sync_log % 60 == 0) {
+                    UtilityFunctions::print("[VIDEO_SYNC] Frame at ", frame_pts, " shown. Queue: ", video_packet_queue.size());
                 }
             }
         }
 
         video_packet_queue.pop_front();
         av_packet_free(&packet);
-        if (frame_shown) break; // عرضنا فريم واحد، اخرج لانتظار الفريم القادم من جودو
+        if (frame_decoded) break;
     }
 
-    // معالجة الصوت من مخزنه الخاص بشكل مستقل
+    // معالجة الصوت (مستقلة كما طلبت)
     while (!audio_packet_queue.empty()) {
         AVPacket *a_pkt = audio_packet_queue.front();
         if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
@@ -471,6 +461,8 @@ void FFmpegPlayer::_decode_next_frame() {
     av_frame_free(&video_frame);
     av_frame_free(&rgb_frame);
 }
+
+
 
 
 
