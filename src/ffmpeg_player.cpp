@@ -285,9 +285,8 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     swr_ctx = swr_alloc();
 
     AVChannelLayout out_ch_layout;
-    av_channel_layout_default(&out_ch_layout, 2); // Stereo
+    av_channel_layout_default(&out_ch_layout, 2); 
 
-    // إعداد المحول: نأخذ أي صيغة ونحولها إلى FLT (Float 32-bit)
     av_opt_set_chlayout(swr_ctx, "in_chlayout",  &audio_codec_ctx->ch_layout, 0);
     av_opt_set_chlayout(swr_ctx, "out_chlayout", &out_ch_layout, 0);
     av_opt_set_int(swr_ctx, "in_sample_rate",    audio_codec_ctx->sample_rate, 0);
@@ -295,19 +294,16 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
     av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  audio_codec_ctx->sample_fmt, 0);
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
-    if (swr_init(swr_ctx) < 0) {
-        UtilityFunctions::printerr("[AUDIO_ERROR] Swr init failed!");
-        return false;
-    }
+    if (swr_init(swr_ctx) < 0) return false;
 
     audio_generator.instantiate();
     audio_generator->set_mix_rate(audio_codec_ctx->sample_rate);
-    audio_generator->set_buffer_length(0.5); // زيادة البفر لـ 0.5 ثانية لراحة معالج Realme
+    audio_generator->set_buffer_length(0.5); 
 
     if (audio_player) {
         audio_player->set_stream(audio_generator);
-        audio_player->play(); // البدء فوراً لتجهيز الـ Playback
-        UtilityFunctions::print("[AUDIO_DEBUG] Configured: ", audio_codec_ctx->sample_rate, "Hz, Stereo, FLT");
+        // تم حذف audio_player->play() من هنا ❌
+        UtilityFunctions::print("[AUDIO_DEBUG] Ready. Waiting for video buffer to start...");
     }
 
     audio_sample_rate = audio_codec_ctx->sample_rate;
@@ -383,23 +379,22 @@ void FFmpegPlayer::_clear_queues() {
     UtilityFunctions::print("[QUEUE_CLEAN] Freed ", v_size, " video and ", a_size, " audio packets.");
 }
 void FFmpegPlayer::_clear_audio_buffers() {
-    // 1. إعادة تهيئة محول العينات (FFmpeg Side)
     if (swr_ctx) {
         swr_close(swr_ctx);
         swr_init(swr_ctx);
     }
     
-    // 2. تنظيف مخزن جودو الصوتي (Godot Side)
-    // بما أن دالة clear() غير موجودة في المولد، نقوم بإعادة تشغيل المشغل لتفريغ الـ Playback Buffer
     if (audio_player) {
-        bool was_playing = playing;
         audio_player->stop(); 
-        if (was_playing) {
-            audio_player->play();
-        }
+        // لا نقوم بعمل play هنا أبداً، نترك الـ _decode_next_frame تقرر متى يبدأ
     }
-    UtilityFunctions::print("[AUDIO] Buffers cleared after seek.");
+    
+    // تصفير عداد الوقت لضمان أن المزامنة ستبدأ من نقطة الصفر الحقيقية
+    position = (fmt_ctx && fmt_ctx->start_time != AV_NOPTS_VALUE) ? (double)fmt_ctx->start_time / AV_TIME_BASE : position;
+    
+    UtilityFunctions::print("[AUDIO] Buffers cleared and ready for fresh start.");
 }
+
 
 // ─── فكّ الترميز: فيديو + صوت ─────────────────────────────────────────
 
