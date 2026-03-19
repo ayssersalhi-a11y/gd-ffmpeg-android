@@ -1,7 +1,7 @@
 /**
  * ffmpeg_player.h
  * تعريف كلاس FFmpegPlayer - GDExtension لـ Godot 4
- * تم التعديل لإضافة نظام Prefill والمزامنة المتقدمة لـ Realme C33
+ * تم التعديل لإضافة نظام المزامنة المتقدمة (Audio Master Clock) مع الحفاظ على بنية الـ Prefill
  */
 
 #pragma once
@@ -93,7 +93,7 @@ private:
     // ── نظام مخزن الحزم (The Queues) ──────────────────────────────────────────
     std::list<AVPacket*> video_packet_queue;
     std::list<AVPacket*> audio_packet_queue;
-    const int MAX_QUEUE_SIZE = 120; // سعة تخزين مناسبة لرامات Realme C33
+    const int MAX_QUEUE_SIZE = 120; // سعة مناسبة لرامات Realme C33
 
     // ── حالة التشغيل والمزامنة ───────────────────────────────────────────────
     bool   playing = false;
@@ -102,13 +102,17 @@ private:
     double duration = 0.0;
     double position = 0.0;
 
+    // 👈 متغيرات الساعة المرجعية (المهمة جداً لنسخة ربليت)
+    double audio_pts_offset = 0.0; 
+    bool   audio_pts_set    = false;
+
     // ── دوال مساعدة داخلية ────────────────────────────────────────────────────
     bool _setup_audio(AVStream *astream);
-    void _read_packets_to_queue(); // دالة ملء الخزان الخام
-    void _prefill_buffers();      // 👈 دالة الإحماء الجديدة: تملأ البفر قبل الانطلاق
-    void _decode_next_frame();     // دالة التوزيع الذكي (أولوية للصوت)
+    void _read_packets_to_queue(); 
+    void _prefill_buffers();      
+    void _decode_next_frame();     
     void _push_audio_samples(AVFrame *frame);
-    void _clear_queues();          // تنظيف المخازن عند الـ Seek أو الإيقاف
+    void _clear_queues();          
     void _cleanup();
     void _allocate_buffers();      
     void _clear_audio_buffers();   
