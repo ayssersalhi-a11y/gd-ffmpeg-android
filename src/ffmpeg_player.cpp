@@ -238,20 +238,39 @@ void FFmpegPlayer::stop() {
 }
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
+    
+    // 1. إيقاف الصوت فوراً لمنع الضجيج أثناء القفز
     if (audio_player) audio_player->stop();
+    
+    // 2. تنظيف الطوابير تماماً (مهم جداً لعدم عرض إطارات قديمة)
     _clear_queues();
 
+    // 3. تحويل الثواني إلى وحدة زمن FFmpeg والقفز لأقرب إطار مفتاحي
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
+    // استخدمنا FLAG_BACKWARD لضمان الوقوف على Keyframe صالح للصورة
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
 
+    // 4. تنظيف الـ Buffers الداخلية للمشفرات (Flush)
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
-    if (swr_ctx) { swr_close(swr_ctx); swr_init(swr_ctx); }
+    
+    // 5. إعادة تهيئة محول الصوت
+    if (swr_ctx) { 
+        swr_close(swr_ctx); 
+        swr_init(swr_ctx); 
+    }
 
-    position         = seconds;
+    // 6. تحديث الوقت وهدم الساعة القديمة
+    position = seconds;
     audio_pts_offset = seconds; 
-    audio_pts_set    = false;    
-    UtilityFunctions::print("[SEEK] Jumped to: ", seconds, "s");
+    audio_pts_set = false; 
+    
+    // 7. استدعاء قراءة حزم أولية فوراً لملء الفراغ الناتج عن الـ Seek
+    for (int i = 0; i < 15; i++) {
+        _read_packets_to_queue();
+    }
+
+    UtilityFunctions::print("[SEEK_SYNC] Jumped to: ", seconds, "s and Queues Refilled.");
 }
 
 
@@ -445,14 +464,12 @@ void FFmpegPlayer::_prefill_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
+    // فك تشفير الصوت (بقي كما هو لضمان استمرار التدفق)
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         int space = pb.is_valid() ? pb->get_frames_available() : 0;
-
-        // لا نلمس الحزمة الصوتية إلا إذا كان هناك متسع لها
         while (!audio_packet_queue.empty() && space > 2048) {
             AVPacket *a_pkt = audio_packet_queue.front();
-
             if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
                 AVFrame *af = av_frame_alloc();
                 while (avcodec_receive_frame(audio_codec_ctx, af) == 0) {
@@ -475,11 +492,13 @@ void FFmpegPlayer::_decode_next_frame() {
 
     while (!video_packet_queue.empty()) {
         AVPacket *pkt = video_packet_queue.front();
-        double pts    = pkt->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+        double pts = pkt->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        if (pts > position + 0.04) break;
+        // إذا كان الإطار بعيداً جداً في المستقبل، انتظر (المزامنة)
+        if (pts > position + 0.1) break; 
 
-        if (pts < position - 0.15) {
+        // إذا كان الإطار قديماً جداً (أصغر من الوقت الحالي بـ 0.5 ثانية)، احذفه بسرعة للحاق بالصوت
+        if (pts < position - 0.5) {
             video_packet_queue.pop_front();
             av_packet_free(&pkt);
             continue;
@@ -491,9 +510,8 @@ void FFmpegPlayer::_decode_next_frame() {
                 sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, rgb->data, rgb->linesize);
 
                 PackedByteArray pba;
-                int sz = video_width * video_height * 3;
-                pba.resize(sz);
-                memcpy(pba.ptrw(), frame_buffer, sz);
+                pba.resize(video_width * video_height * 3);
+                memcpy(pba.ptrw(), frame_buffer, pba.size());
 
                 Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
                 if (current_texture.is_valid()) current_texture->update(img);
@@ -518,40 +536,55 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
     if (pb.is_null()) return;
 
-    // ضبط إزاحة الساعة من أول إطار صوتي حقيقي
+    // 1. إعادة ضبط إزاحة الساعة (Offset) بعد الـ Seek أو عند أول إطار
     if (!audio_pts_set && frame->pts != AV_NOPTS_VALUE && audio_stream_idx >= 0) {
         double frame_pts = frame->pts * av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
         audio_pts_offset = frame_pts;
-        audio_pts_set    = true;
-        UtilityFunctions::print("[AUDIO_CLOCK] PTS offset set: ", audio_pts_offset, "s");
+        audio_pts_set = true;
+        // تحديث الموقع الحالي فوراً ليتطابق مع نقطة البداية الجديدة
+        position = audio_pts_offset;
+        UtilityFunctions::print("[AUDIO_SYNC] Clock Reset. New Offset: ", audio_pts_offset);
     }
 
+    // 2. التأكد من وجود مساحة في بفر جودو
     int frames_available = pb->get_frames_available();
     if (frames_available < frame->nb_samples) return; 
 
+    // 3. حساب عدد العينات المخرجة المتوقع بعد التحويل
     int out_count = (int)av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples,
         audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
 
-    uint8_t *out_buf  = nullptr;
-    int      linesize = 0;
+    uint8_t *out_buf = nullptr;
+    int linesize = 0;
+    
+    // تخصيص ذاكرة مؤقتة للعينات المحولة (بصيغة Float Stereo)
     if (av_samples_alloc(&out_buf, &linesize, 2, out_count, AV_SAMPLE_FMT_FLT, 0) < 0) return;
 
+    // 4. عملية التحويل الفعلية (Resampling)
     int converted = swr_convert(swr_ctx, &out_buf, out_count, (const uint8_t **)frame->data, frame->nb_samples);
 
     if (converted > 0) {
-        const float *s = reinterpret_cast<const float *>(out_buf);
-        PackedVector2Array buf;
-        buf.resize(converted);
-        Vector2 *w = buf.ptrw();
+        const float *samples = reinterpret_cast<const float *>(out_buf);
+        PackedVector2Array buffer;
+        buffer.resize(converted);
+        Vector2 *write_ptr = buffer.ptrw();
+
         for (int i = 0; i < converted; i++) {
-            w[i] = Vector2(
-                CLAMP(s[i * 2]     * volume, -1.0f, 1.0f),
-                CLAMP(s[i * 2 + 1] * volume, -1.0f, 1.0f)
+            // تحويل العينات إلى Vector2 (L, R) مع التحكم في مستوى الصوت (Volume)
+            write_ptr[i] = Vector2(
+                CLAMP(samples[i * 2]     * volume, -1.0f, 1.0f),
+                CLAMP(samples[i * 2 + 1] * volume, -1.0f, 1.0f)
             );
         }
-        pb->push_buffer(buf);
+        
+        // 5. دفع البيانات إلى جودو
+        pb->push_buffer(buffer);
     }
-    av_freep(&out_buf);
+
+    // 6. تنظيف الذاكرة المؤقتة للعينات
+    if (out_buf) {
+        av_freep(&out_buf);
+    }
 }
 
 
