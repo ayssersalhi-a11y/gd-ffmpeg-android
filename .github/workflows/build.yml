@@ -2,17 +2,6 @@
 # ║  GitHub Actions — بناء libgdffmpeg.so لـ Android                    ║
 # ║  المخرج: libgdffmpeg.android.arm64.so  (~5-15 MB)                   ║
 # ╚══════════════════════════════════════════════════════════════════════╝
-#
-# هيكل الريبو المطلوب:
-#   your-repo/
-#   ├── .github/workflows/build.yml   ← هذا الملف
-#   ├── src/
-#   │   └── ffmpeg_player.cpp
-#   ├── include/
-#   │   └── ffmpeg_player.h
-#   ├── CMakeLists.txt
-#   ├── ffmpeg_build_android.sh
-#   └── gdffmpeg.gdextension
 
 name: Build libgdffmpeg.so for Android
 
@@ -72,15 +61,16 @@ jobs:
             --depth 1 \
             godot-cpp
 
-      # ── 5. كاش FFmpeg (يوفر ~30 دقيقة عند الإعادة) ──────────────────
+      # ── 5. كاش FFmpeg (تم تغيير المفتاح لإجبار البناء الجديد بالعتاد) ──────────
       - name: Cache FFmpeg Android libraries
         uses: actions/cache@v4
         id: cache-ffmpeg
         with:
           path: ffmpeg-android
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-android-api${{ env.ANDROID_API }}-ndk${{ env.NDK_VERSION }}
+          # تم إضافة -hw-v1 لضمان تجاهل النسخة القديمة وتفعيل MediaCodec
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-android-api${{ env.ANDROID_API }}-ndk${{ env.NDK_VERSION }}-hw-v1
 
-      # ── 6. بناء FFmpeg (فقط إذا لم يوجد في الكاش) ───────────────────
+      # ── 6. بناء FFmpeg (فقط إذا لم يوجد في الكاش المحدث) ───────────────
       - name: Build FFmpeg for Android arm64-v8a
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         env:
@@ -110,7 +100,7 @@ jobs:
 
           cmake --build build/arm64 --parallel $(nproc)
 
-      # ── 8. بناء libgdffmpeg.so — ARM 32-bit (اختياري) ───────────────
+      # ── 8. بناء libgdffmpeg.so — ARM 32-bit (للتوافق الشامل) ──────────
       - name: Build libgdffmpeg.so (armeabi-v7a)
         env:
           NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
