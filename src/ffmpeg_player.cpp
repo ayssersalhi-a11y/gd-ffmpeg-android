@@ -90,9 +90,31 @@ FFmpegPlayer::~FFmpegPlayer() {
 
 // ─── _ready: تهيئة AudioStreamPlayer كـ child node ───────────────────────────
 void FFmpegPlayer::_ready() {
+    // تهيئة الصوت
     audio_player = memnew(AudioStreamPlayer);
     audio_player->set_name("_AudioPlayer");
     add_child(audio_player);
+
+    // --- نظام فحص ميزات المكتبة المتاحة ---
+    UtilityFunctions::print("--- FFmpeg Capabilities Check ---");
+    void *opaque = nullptr;
+    const AVCodec *codec;
+    bool has_mediacodec = false;
+
+    while ((codec = av_codec_iterate(&opaque))) {
+        if (av_codec_is_decoder(codec)) {
+            String name = String(codec->name);
+            if (name.find("mediacodec") != -1) {
+                UtilityFunctions::print("[FOUND] Hardware Decoder: ", name);
+                has_mediacodec = true;
+            }
+        }
+    }
+
+    if (!has_mediacodec) {
+        UtilityFunctions::printerr("[CRITICAL] MediaCodec support NOT found in current FFmpeg build!");
+    }
+    UtilityFunctions::print("---------------------------------");
 }
 
 // ─── تحميل الفيديو ───────────────────────────────────────────────────────────
@@ -105,7 +127,7 @@ bool FFmpegPlayer::load_video(const String &path) {
         return false;
     }
 
-    UtilityFunctions::print("[LOAD] Attempting to open: ", path);
+    UtilityFunctions::print("[LOAD] Searching for Hardware Decoders for: ", path);
 
     if (!audio_player) {
         audio_player = memnew(AudioStreamPlayer);
@@ -113,22 +135,15 @@ bool FFmpegPlayer::load_video(const String &path) {
     }
 
     String real_path = ProjectSettings::get_singleton()->globalize_path(path);
-    
-    // تحويل المسار ليكون متوافقاً مع C-Style وتجنب الانهيار
     CharString utf8_path = real_path.utf8();
     const char *c_path = utf8_path.get_data();
 
-    int ret = avformat_open_input(&fmt_ctx, c_path, nullptr, nullptr);
-    if (ret < 0) {
-        char errbuff[512];
-        av_strerror(ret, errbuff, sizeof(errbuff));
-        UtilityFunctions::printerr("[LOAD] FFmpeg Error: ", errbuff);
+    if (avformat_open_input(&fmt_ctx, c_path, nullptr, nullptr) < 0) {
         _emit_video_loaded(false);
         return false;
     }
 
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        UtilityFunctions::printerr("[LOAD] Could not find stream info");
         _cleanup();
         return false;
     }
@@ -138,19 +153,43 @@ bool FFmpegPlayer::load_video(const String &path) {
 
     if (video_stream_idx >= 0) {
         AVStream *vstream = fmt_ctx->streams[video_stream_idx];
-        const AVCodec *vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
+        const AVCodec *vcodec = nullptr;
+
+        // --- محاولة صيد مشفر MediaCodec العتادي ---
+        if (vstream->codecpar->codec_id == AV_CODEC_ID_H264) {
+            vcodec = avcodec_find_decoder_by_name("h264_mediacodec");
+        } else if (vstream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+            vcodec = avcodec_find_decoder_by_name("hevc_mediacodec");
+        }
+
+        // صمام أمان: إذا لم نجد العتاد، نستخدم المشفر البرمجي الافتراضي
+        if (!vcodec) {
+            vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
+            UtilityFunctions::print("[VIDEO] Mode: SOFTWARE (Expect more heat).");
+        } else {
+            UtilityFunctions::print("[VIDEO] Mode: HARDWARE (MediaCodec - Stay cool).");
+        }
+
         if (vcodec) {
             video_codec_ctx = avcodec_alloc_context3(vcodec);
             avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-            avcodec_open2(video_codec_ctx, vcodec, nullptr);
-            video_width = video_codec_ctx->width;
-            video_height = video_codec_ctx->height;
-            fps = av_q2d(vstream->r_frame_rate);
             
-            sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
-                                     video_width, video_height, AV_PIX_FMT_RGB24,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-            _allocate_buffers();
+            // تفعيل تعدد الأنوية فقط في حال المشفر البرمجي
+            if (String(vcodec->name).find("mediacodec") == -1) {
+                video_codec_ctx->thread_count = 0; 
+            }
+
+            if (avcodec_open2(video_codec_ctx, vcodec, nullptr) >= 0) {
+                video_width = video_codec_ctx->width;
+                video_height = video_codec_ctx->height;
+                fps = av_q2d(vstream->r_frame_rate);
+                
+                // تحسين: SWS_FAST_BILINEAR لسرعة معالجة البكسلات
+                sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
+                                         video_width, video_height, AV_PIX_FMT_RGB24,
+                                         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                _allocate_buffers();
+            }
         }
     }
 
@@ -160,7 +199,6 @@ bool FFmpegPlayer::load_video(const String &path) {
 
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE) ? (double)fmt_ctx->duration / AV_TIME_BASE : 0.0;
     _emit_video_loaded(true);
-    UtilityFunctions::print("[LOAD] Success. Duration: ", duration);
     return true;
 }
 
