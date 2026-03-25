@@ -239,38 +239,45 @@ void FFmpegPlayer::stop() {
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx) return;
     
-    // 1. إيقاف الصوت فوراً لمنع الضجيج أثناء القفز
+    // 1. حفظ حالة التشغيل وإيقاف المؤقت
+    bool was_playing = playing;
+    playing = false; 
+
     if (audio_player) audio_player->stop();
     
-    // 2. تنظيف الطوابير تماماً (مهم جداً لعدم عرض إطارات قديمة)
+    // 2. مسح شامل للطوابير (لا نريد أي إطار قديم)
     _clear_queues();
 
-    // 3. تحويل الثواني إلى وحدة زمن FFmpeg والقفز لأقرب إطار مفتاحي
+    // 3. القفز في ملف الفيديو
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
-    // استخدمنا FLAG_BACKWARD لضمان الوقوف على Keyframe صالح للصورة
     av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
 
-    // 4. تنظيف الـ Buffers الداخلية للمشفرات (Flush)
+    // 4. تنظيف المشفرات (مهم جداً لعدم تجميد الصورة)
     if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
     
-    // 5. إعادة تهيئة محول الصوت
     if (swr_ctx) { 
         swr_close(swr_ctx); 
         swr_init(swr_ctx); 
     }
 
-    // 6. تحديث الوقت وهدم الساعة القديمة
+    // 5. إعادة ضبط الساعة الداخلية
     position = seconds;
     audio_pts_offset = seconds; 
     audio_pts_set = false; 
     
-    // 7. استدعاء قراءة حزم أولية فوراً لملء الفراغ الناتج عن الـ Seek
-    for (int i = 0; i < 15; i++) {
+    // 6. "التسخين": ملء الطابور ببيانات النقطة الجديدة فوراً
+    for (int i = 0; i < 8; i++) {
         _read_packets_to_queue();
     }
 
-    UtilityFunctions::print("[SEEK_SYNC] Jumped to: ", seconds, "s and Queues Refilled.");
+    // 7. استئناف التشغيل إذا كان يعمل سابقاً
+    if (was_playing) {
+        playing = true;
+        if (audio_player) audio_player->play();
+    }
+
+    UtilityFunctions::print("[SEEK] Sync Complete at: ", seconds);
 }
 
 
@@ -369,11 +376,14 @@ void FFmpegPlayer::_emit_playback_error(const String &message) {
 }
 
 void FFmpegPlayer::_read_packets_to_queue() {
-    if (!fmt_ctx || (video_packet_queue.size() + audio_packet_queue.size()) > MAX_QUEUE_SIZE) return;
+    if (!fmt_ctx) return;
+    
+    // الحد الأقصى للطابور لمنع استهلاك الرام
+    if ((video_packet_queue.size() + audio_packet_queue.size()) > MAX_QUEUE_SIZE) return;
 
     AVPacket *packet = av_packet_alloc();
-    // نقرأ 20 حزمة في كل دورة كحد أقصى لتعبئة المخزن
-    for (int i = 0; i < 20; i++) {
+    // نقرأ 32 حزمة في كل دورة لضمان سرعة الاستجابة
+    for (int i = 0; i < 32; i++) {
         if (av_read_frame(fmt_ctx, packet) < 0) {
             av_packet_free(&packet);
             break;
@@ -464,7 +474,7 @@ void FFmpegPlayer::_prefill_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // فك تشفير الصوت (بقي كما هو لضمان استمرار التدفق)
+    // معالجة الصوت (تلقائي)
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         int space = pb.is_valid() ? pb->get_frames_available() : 0;
@@ -494,11 +504,11 @@ void FFmpegPlayer::_decode_next_frame() {
         AVPacket *pkt = video_packet_queue.front();
         double pts = pkt->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // إذا كان الإطار بعيداً جداً في المستقبل، انتظر (المزامنة)
-        if (pts > position + 0.1) break; 
+        // المزامنة: إذا كان الإطار مستقبلياً جداً، انتظر
+        if (pts > position + 0.05) break; 
 
-        // إذا كان الإطار قديماً جداً (أصغر من الوقت الحالي بـ 0.5 ثانية)، احذفه بسرعة للحاق بالصوت
-        if (pts < position - 0.5) {
+        // إذا كان الإطار قديماً (أكثر من 0.3 ثانية)، احذفه فوراً للحاق بالصوت
+        if (pts < position - 0.3) {
             video_packet_queue.pop_front();
             av_packet_free(&pkt);
             continue;
