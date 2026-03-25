@@ -1,10 +1,10 @@
 #!/bin/bash
-# ffmpeg_build_android.sh - النسخة المحدثة لدعم العتاد (Hardware Acceleration)
-# يعمل محلياً وفي GitHub Actions لـ Godot GDExtension
+# ffmpeg_build_android.sh
+# يعمل محلياً وفي GitHub Actions - تم التعديل لدعم MediaCodec (العتاد)
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-# ── الإعدادات ───────────────────────────────────────────────────────────────
+# ── الإعدادات: تأتي من متغيرات البيئة أو القيم الافتراضية ───────────────────
 NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/ffmpeg-android}"
@@ -12,14 +12,20 @@ API_LEVEL="${API_LEVEL:-24}"
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
-echo "║  بناء FFmpeg ${FFMPEG_VERSION} مع دعم العتاد (MediaCodec) ║"
+echo "║  بناء FFmpeg ${FFMPEG_VERSION} لـ Android (HW Support)  ║"
 echo "╚══════════════════════════════════════════════╝"
+echo "  NDK_PATH   : ${NDK_PATH}"
+echo "  OUTPUT_DIR : ${OUTPUT_DIR}"
+echo "  API Level  : ${API_LEVEL}"
+echo ""
 
-# ── تحميل FFmpeg ─────────────────────────────────────────────────────────────
+# ── تحميل FFmpeg إذا لم يوجد ─────────────────────────────────────────────────
 FFMPEG_SRC="ffmpeg-${FFMPEG_VERSION}"
 if [ ! -d "${FFMPEG_SRC}" ]; then
     echo "── تحميل FFmpeg ${FFMPEG_VERSION} ──"
-    wget -q --show-progress "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -O "ffmpeg-${FFMPEG_VERSION}.tar.gz"
+    wget -q --show-progress \
+        "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" \
+        -O "ffmpeg-${FFMPEG_VERSION}.tar.gz"
     tar xzf "ffmpeg-${FFMPEG_VERSION}.tar.gz"
     rm "ffmpeg-${FFMPEG_VERSION}.tar.gz"
 fi
@@ -34,7 +40,7 @@ build_abi() {
     local PREFIX="${OUTPUT_DIR}/${ABI}"
     mkdir -p "${PREFIX}"
 
-    echo "══ بناء FFmpeg لـ ${ABI} (Hardware Enabled) ══"
+    echo "══ بناء FFmpeg لـ ${ABI} ══"
 
     local TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
     local SYSROOT="${TOOLCHAIN}/sysroot"
@@ -78,10 +84,14 @@ build_abi() {
         \
         --enable-jni \
         --enable-mediacodec \
-        --enable-hwaccel=h264_mediacodec \
-        --enable-hwaccel=hevc_mediacodec \
         --enable-decoder=h264_mediacodec \
         --enable-decoder=hevc_mediacodec \
+        --enable-decoder=vp8_mediacodec \
+        --enable-decoder=vp9_mediacodec \
+        --enable-hwaccel=h264_mediacodec \
+        --enable-hwaccel=hevc_mediacodec \
+        --enable-hwaccel=vp8_mediacodec \
+        --enable-hwaccel=vp9_mediacodec \
         \
         --enable-decoder=h264 \
         --enable-decoder=hevc \
@@ -123,4 +133,8 @@ build_abi "arm64-v8a" "aarch64" "armv8-a" "aarch64-linux-android"
 build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
 
 echo ""
-echo "✓ تمت العملية بنجاح. الآن يمكنك إعادة رفع الملفات لـ GitHub لبدء البناء."
+echo "✓ FFmpeg 64-bit: ${OUTPUT_DIR}/arm64-v8a/lib/"
+ls -lh "${OUTPUT_DIR}/arm64-v8a/lib/"
+
+echo "✓ FFmpeg 32-bit: ${OUTPUT_DIR}/armeabi-v7a/lib/"
+ls -lh "${OUTPUT_DIR}/armeabi-v7a/lib/"
