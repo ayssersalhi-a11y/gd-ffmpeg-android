@@ -512,68 +512,92 @@ void FFmpegPlayer::_prefill_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // معالجة الصوت (تلقائي)
+    // 1. معالجة الصوت (تلقائي ومستمر)
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
-        int space = pb.is_valid() ? pb->get_frames_available() : 0;
-        while (!audio_packet_queue.empty() && space > 2048) {
-            AVPacket *a_pkt = audio_packet_queue.front();
-            if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-                AVFrame *af = av_frame_alloc();
-                while (avcodec_receive_frame(audio_codec_ctx, af) == 0) {
-                    _push_audio_samples(af);
-                    space -= af->nb_samples; 
-                    av_frame_unref(af);
+        if (pb.is_valid()) {
+            int space = pb->get_frames_available();
+            while (!audio_packet_queue.empty() && space > 2048) {
+                AVPacket *a_pkt = audio_packet_queue.front();
+                if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
+                    AVFrame *af = av_frame_alloc();
+                    while (avcodec_receive_frame(audio_codec_ctx, af) == 0) {
+                        _push_audio_samples(af);
+                        space -= af->nb_samples;
+                        av_frame_unref(af);
+                    }
+                    av_frame_free(&af);
                 }
-                av_frame_free(&af);
+                audio_packet_queue.pop_front();
+                av_packet_free(&a_pkt);
             }
-            audio_packet_queue.pop_front();
-            av_packet_free(&a_pkt);
         }
     }
 
-    if (video_packet_queue.empty()) return;
+    if (video_packet_queue.empty() || !video_codec_ctx) return;
 
-    AVFrame *vf  = av_frame_alloc();
-    AVFrame *rgb = av_frame_alloc();
-    bool decoded = false;
-
-    while (!video_packet_queue.empty()) {
+    // 2. إرسال الحزم للمشفر العتادي (بدون حذف مسبق)
+    // العتاد يحتاج كل الحزم لبناء الصورة بشكل صحيح
+    while (!video_packet_queue.empty() && video_packet_queue.size() > 5) {
         AVPacket *pkt = video_packet_queue.front();
-        double pts = pkt->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-
-        // المزامنة: إذا كان الإطار مستقبلياً جداً، انتظر
-        if (pts > position + 0.05) break; 
-
-        // إذا كان الإطار قديماً (أكثر من 0.3 ثانية)، احذفه فوراً للحاق بالصوت
-        if (pts < position - 0.3) {
+        
+        int send_res = avcodec_send_packet(video_codec_ctx, pkt);
+        if (send_res == 0) {
             video_packet_queue.pop_front();
             av_packet_free(&pkt);
+        } else if (send_res == AVERROR(EAGAIN)) {
+            // المشفر ممتلئ، يجب أن نسحب منه الإطارات أولاً
+            break;
+        } else {
+            // خطأ في الحزمة، نحذفها ونكمل
+            video_packet_queue.pop_front();
+            av_packet_free(&pkt);
+        }
+    }
+
+    // 3. استقبال الإطارات وعرضها بناءً على التوقيت
+    AVFrame *vf = av_frame_alloc();
+    AVFrame *rgb = av_frame_alloc();
+    
+    while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
+        double frame_pts = vf->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+
+        // قانون المزامنة الصارم:
+        // إذا كان الإطار قديماً جداً (أقل من الوقت الحالي بـ 0.05)، نتجاهل عرضه ونسحب التالي
+        if (frame_pts < position - 0.05) {
+            av_frame_unref(vf);
             continue;
         }
-
-        if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
-            if (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
-                av_image_fill_arrays(rgb->data, rgb->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
-                sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, rgb->data, rgb->linesize);
-
-                PackedByteArray pba;
-                pba.resize(video_width * video_height * 3);
-                memcpy(pba.ptrw(), frame_buffer, pba.size());
-
-                Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-                if (current_texture.is_valid()) current_texture->update(img);
-                _emit_frame_updated();
-                decoded = true;
-            }
+        
+        // إذا كان الإطار مستقبلياً، نتوقف عن السحب وننتظر الدورة القادمة لـ _process
+        if (frame_pts > position + 0.05) {
+            // ملاحظة: MediaCodec قد لا يحب تخزين الإطارات المسحوبة، لكننا سنكتفي بهذا حالياً
+            av_frame_unref(vf);
+            break; 
         }
-        video_packet_queue.pop_front();
-        av_packet_free(&pkt);
-        if (decoded) break;
+
+        // تحويل وعرض الإطار الصحيح زمنياً
+        av_image_fill_arrays(rgb->data, rgb->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
+        sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, rgb->data, rgb->linesize);
+
+        PackedByteArray pba;
+        pba.resize(video_width * video_height * 3);
+        memcpy(pba.ptrw(), frame_buffer, pba.size());
+
+        Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+        if (current_texture.is_valid()) {
+            current_texture->update(img);
+        }
+        _emit_frame_updated();
+        
+        av_frame_unref(vf);
+        break; // عرضنا إطاراً واحداً، نكتفي بهذا لهذا الـ Frame في جودو
     }
+
     av_frame_free(&vf);
     av_frame_free(&rgb);
 }
+
 
 
 // ─── دفع عينات الصوت إلى Godot AudioStreamGeneratorPlayback ─────────────────
