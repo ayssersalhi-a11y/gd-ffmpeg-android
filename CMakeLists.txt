@@ -60,8 +60,7 @@ target_include_directories(gdffmpeg PRIVATE
     "${GODOT_CPP_DIR}/gen/include"
 )
 
-# ─── ربط مكتبات FFmpeg ───────────────────────────────────────────────────────
-# الترتيب مهم: avcodec يعتمد على avutil، avformat يعتمد على avcodec
+# ─── ربط مكتبات FFmpeg المحدث ───────────────────────────────────────────────────
 target_link_libraries(gdffmpeg PRIVATE
     godot-cpp
     "${FFMPEG_ABI_DIR}/lib/libavformat.a"
@@ -69,12 +68,16 @@ target_link_libraries(gdffmpeg PRIVATE
     "${FFMPEG_ABI_DIR}/lib/libswscale.a"
     "${FFMPEG_ABI_DIR}/lib/libswresample.a"
     "${FFMPEG_ABI_DIR}/lib/libavutil.a"
-    # مكتبات نظام Android المطلوبة
-    android
-    log
-    z
-    m
+    
+    # مكتبات نظام Android الأساسية والمطلوبة للعتاد (MediaCodec)
+    android     # للتعامل مع النظام
+    log         # للطباعة في الـ Logcat
+    z           # للضغط
+    m           # للعمليات الحسابية
+    jnigraphics # ضروري لـ JNI والصور
+    mediandk    # 👈 هذا هو الجسر الحقيقي للوصول للرقاقات العتادية
 )
+
 
 # ─── خيارات التجميع ──────────────────────────────────────────────────────────
 target_compile_options(gdffmpeg PRIVATE
