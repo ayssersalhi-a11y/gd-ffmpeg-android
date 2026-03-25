@@ -1,7 +1,7 @@
 /**
  * ffmpeg_player.h
- * تعريف كلاس FFmpegPlayer - GDExtension لـ Godot 4
- * تم التعديل لإضافة نظام المزامنة المتقدمة (Audio Master Clock) مع الحفاظ على بنية الـ Prefill
+ * GDExtension - FFmpeg Video + Audio Player for Godot 4 (Android ARM64/ARM32)
+ * تم التحديث لدعم فك التشفير العتادي (Hardware Acceleration) وتحسين الأداء.
  */
 
 #pragma once
@@ -27,6 +27,8 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+// تم إضافة هيدر الميديا كودك لضمان التعرف على الوظائف العتادية
+#include <libavcodec/mediacodec.h> 
 }
 
 namespace godot {
@@ -38,7 +40,7 @@ public:
     FFmpegPlayer();
     ~FFmpegPlayer();
 
-    // ── واجهة GDScript ──────────────────────────────────────────────────────
+    // ── واجهة GDScript (المتصلة بـ Godot) ──────────────────────────────────
     bool load_video(const String &path);
     void play();
     void pause();
@@ -93,7 +95,7 @@ private:
     // ── نظام مخزن الحزم (The Queues) ──────────────────────────────────────────
     std::list<AVPacket*> video_packet_queue;
     std::list<AVPacket*> audio_packet_queue;
-    const int MAX_QUEUE_SIZE = 120; // سعة مناسبة لرامات Realme C33
+    const int MAX_QUEUE_SIZE = 120; 
 
     // ── حالة التشغيل والمزامنة ───────────────────────────────────────────────
     bool   playing = false;
@@ -102,7 +104,7 @@ private:
     double duration = 0.0;
     double position = 0.0;
 
-    // 👈 متغيرات الساعة المرجعية (المهمة جداً لنسخة ربليت)
+    // إزاحة الساعة المرجعية للمزامنة بين الصوت والصورة
     double audio_pts_offset = 0.0; 
     bool   audio_pts_set    = false;
 
