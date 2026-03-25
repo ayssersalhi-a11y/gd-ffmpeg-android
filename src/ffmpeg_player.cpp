@@ -275,23 +275,27 @@ void FFmpegPlayer::stop() {
     seek(0.0);
 }
 void FFmpegPlayer::seek(double seconds) {
-    if (!fmt_ctx) return;
+    if (!fmt_ctx || !video_codec_ctx) return;
     
-    // 1. حفظ حالة التشغيل وإيقاف المؤقت
     bool was_playing = playing;
     playing = false; 
 
     if (audio_player) audio_player->stop();
     
-    // 2. مسح شامل للطوابير (لا نريد أي إطار قديم)
+    // 1. مسح شامل للطوابير لضمان عدم وجود بيانات قديمة
     _clear_queues();
 
-    // 3. القفز في ملف الفيديو
-    int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
-    av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
+    // 2. حساب التوقيت بدقة بصيغة FFmpeg
+    int64_t seek_target = (int64_t)(seconds * AV_TIME_BASE);
+    
+    // 3. القفز للإطار الرئيسي الأقرب (AVSEEK_FLAG_BACKWARD يضمن عدم تجاوز الوقت المطلوب)
+    if (av_seek_frame(fmt_ctx, -1, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
+        UtilityFunctions::printerr("[SEEK] Failed to seek to: ", seconds);
+        return;
+    }
 
-    // 4. تنظيف المشفرات (مهم جداً لعدم تجميد الصورة)
-    if (video_codec_ctx) avcodec_flush_buffers(video_codec_ctx);
+    // 4. أهم خطوة للعتاد: تنظيف بفر المشفر (Flush) ليتخلص من الحالة القديمة
+    avcodec_flush_buffers(video_codec_ctx);
     if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
     
     if (swr_ctx) { 
@@ -299,23 +303,29 @@ void FFmpegPlayer::seek(double seconds) {
         swr_init(swr_ctx); 
     }
 
-    // 5. إعادة ضبط الساعة الداخلية
+    // 5. إعادة ضبط الساعة المرجعية
     position = seconds;
     audio_pts_offset = seconds; 
     audio_pts_set = false; 
     
-    // 6. "التسخين": ملء الطابور ببيانات النقطة الجديدة فوراً
-    for (int i = 0; i < 8; i++) {
+    // 6. "حل مشكلة الصيغ العتادية المتغيرة":
+    // نقوم بتصفير sws_ctx ليتم إعادة بنائه بناءً على أول إطار يصل بعد القفز
+    if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+        sws_ctx = nullptr; 
+    }
+
+    // 7. تعبئة أولية سريعة للطابور قبل الاستئناف
+    for (int i = 0; i < 15; i++) {
         _read_packets_to_queue();
     }
 
-    // 7. استئناف التشغيل إذا كان يعمل سابقاً
     if (was_playing) {
         playing = true;
         if (audio_player) audio_player->play();
     }
 
-    UtilityFunctions::print("[SEEK] Sync Complete at: ", seconds);
+    UtilityFunctions::print("[SEEK] Hardware Sync Complete at: ", seconds);
 }
 
 
@@ -324,28 +334,36 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!playing || !fmt_ctx) return;
 
+    // 1. تحديث الساعة المرجعية بدقة
     if (audio_stream_idx >= 0 && audio_player && audio_player->is_playing()) {
-        // المعادلة الذهبية: الوقت الحقيقي = إزاحة أول حزمة + ما تم تشغيله فعلياً
-        position = audio_pts_offset + audio_player->get_playback_position();
+        // نستخدم الوقت الفعلي من AudioStreamPlayer لضمان التطابق مع ما يسمعه المستخدم
+        double audio_time = audio_pts_offset + audio_player->get_playback_position();
+        
+        // منع القفزات المفاجئة في الوقت (تنعيم الساعة)
+        if (Math::abs(audio_time - position) > 0.5) {
+            position = audio_time; // قفزة كبيرة (مثلاً بعد Seek)
+        } else {
+            position = Math::lerp(position, audio_time, 0.5); // مزامنة ناعمة
+        }
     } else {
-        // Fallback في حال عدم وجود صوت
+        // في حال عدم وجود صوت، نعتمد على توقيت النظام (Delta)
         position += delta;
     }
 
+    // 2. استدعاء فك التشفير للإطار التالي بناءً على الساعة الجديدة
     _decode_next_frame();
 
+    // 3. التحقق من نهاية الفيديو أو التكرار
     if (duration > 0.0 && position >= duration) {
         if (looping) {
             seek(0.0);
-            if (audio_player && audio_generator.is_valid()) {
-                audio_player->play();
-            }
         } else {
             stop();
             _emit_video_finished();
         }
     }
 }
+
 
 
 
@@ -512,7 +530,7 @@ void FFmpegPlayer::_prefill_buffers() {
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // 1. معالجة الصوت (تلقائي ومستمر)
+    // 1. معالجة الصوت: نتركها تعمل باستمرار لتوفير الساعة المرجعية للمزامنة
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         if (pb.is_valid()) {
@@ -536,50 +554,57 @@ void FFmpegPlayer::_decode_next_frame() {
 
     if (video_packet_queue.empty() || !video_codec_ctx) return;
 
-    // 2. إرسال الحزم للمشفر العتادي (بدون حذف مسبق)
-    // العتاد يحتاج كل الحزم لبناء الصورة بشكل صحيح
-    while (!video_packet_queue.empty() && video_packet_queue.size() > 5) {
+    // 2. إرسال الحزم لرقاقة العتاد (MediaCodec)
+    while (!video_packet_queue.empty()) {
         AVPacket *pkt = video_packet_queue.front();
-        
         int send_res = avcodec_send_packet(video_codec_ctx, pkt);
+        
         if (send_res == 0) {
             video_packet_queue.pop_front();
             av_packet_free(&pkt);
         } else if (send_res == AVERROR(EAGAIN)) {
-            // المشفر ممتلئ، يجب أن نسحب منه الإطارات أولاً
             break;
         } else {
-            // خطأ في الحزمة، نحذفها ونكمل
             video_packet_queue.pop_front();
             av_packet_free(&pkt);
         }
     }
 
-    // 3. استقبال الإطارات وعرضها بناءً على التوقيت
+    // 3. استقبال الإطارات من العتاد مع المزامنة الذكية
     AVFrame *vf = av_frame_alloc();
-    AVFrame *rgb = av_frame_alloc();
-    
+
     while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
         double frame_pts = vf->pts * av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-        // قانون المزامنة الصارم:
-        // إذا كان الإطار قديماً جداً (أقل من الوقت الحالي بـ 0.05)، نتجاهل عرضه ونسحب التالي
-        if (frame_pts < position - 0.05) {
+        // --- نظام إسقاط الإطارات المتأخرة (حل الـ Lag) ---
+        if (frame_pts < position - 0.04) {
             av_frame_unref(vf);
-            continue;
+            continue; 
         }
+
+        // إطار مستقبلي، ننتظر الدورة القادمة
+        if (frame_pts > position + 0.04) {
+            av_frame_unref(vf);
+            break;
+        }
+
+        // --- نظام كشف الصيغة العتادية المتغيرة ---
+        // إذا تغيرت صيغة بكسلات العتاد (مثلاً من YUV إلى NV12)، نعيد بناء السياق فوراً
+        if (!sws_ctx) {
+            sws_ctx = sws_getContext(video_width, video_height, (AVPixelFormat)vf->format,
+                                     video_width, video_height, AV_PIX_FMT_RGB24,
+                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+            UtilityFunctions::print("[SWS] Hardware Format Auto-Detected: ", vf->format);
+        }
+
+        // تحويل الإطار إلى RGB24
+        // نستخدم linesize المناسب للصيغة المكتشفة تلقائياً
+        uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
+        int dest_linesize[4] = { video_width * 3, 0, 0, 0 };
         
-        // إذا كان الإطار مستقبلياً، نتوقف عن السحب وننتظر الدورة القادمة لـ _process
-        if (frame_pts > position + 0.05) {
-            // ملاحظة: MediaCodec قد لا يحب تخزين الإطارات المسحوبة، لكننا سنكتفي بهذا حالياً
-            av_frame_unref(vf);
-            break; 
-        }
+        sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, dest, dest_linesize);
 
-        // تحويل وعرض الإطار الصحيح زمنياً
-        av_image_fill_arrays(rgb->data, rgb->linesize, frame_buffer, AV_PIX_FMT_RGB24, video_width, video_height, 1);
-        sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, rgb->data, rgb->linesize);
-
+        // تحديث التكستشر في جودو
         PackedByteArray pba;
         pba.resize(video_width * video_height * 3);
         memcpy(pba.ptrw(), frame_buffer, pba.size());
@@ -591,11 +616,10 @@ void FFmpegPlayer::_decode_next_frame() {
         _emit_frame_updated();
         
         av_frame_unref(vf);
-        break; // عرضنا إطاراً واحداً، نكتفي بهذا لهذا الـ Frame في جودو
+        break; 
     }
 
     av_frame_free(&vf);
-    av_frame_free(&rgb);
 }
 
 
