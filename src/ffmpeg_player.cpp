@@ -406,7 +406,7 @@ void FFmpegPlayer::seek(double seconds) {
 }
 
 // ─── _process ────────────────────────────────────────────────────────────────
-func void FFmpegPlayer::_process(double delta) {
+void FFmpegPlayer::_process(double delta) {
     if (!fmt_ctx || !playing || buffering) return;
 
     // 1. تحديث إحصائيات البافر لمعرفة هل نحتاج للتوقف (Underrun)
