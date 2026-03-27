@@ -108,13 +108,16 @@ private:
     const int MAX_QUEUE_SIZE = 600;
 
     // ── حالة التشغيل ─────────────────────────────────────────────────────────
-    bool   playing   = false;
-    bool   looping   = false;
-    bool   buffering = false;
-    float  volume    = 1.0f;
-    double duration  = 0.0;
-    double position  = 0.0;
+    bool   playing      = false;
+    bool   looping      = false;
+    bool   buffering    = false;
+    float  volume       = 1.0f;
+    double duration     = 0.0;
+    double position     = 0.0;
     bool   is_streaming = false;
+
+    // إزاحة start_time للملف (يُعوّض عنها في حسابات PTS)
+    double stream_start_time = 0.0;
 
     // ── نظام البافر الديناميكي ────────────────────────────────────────────────
     double forward_buffer_secs = 0.0;   // بالثواني: كم لدينا أمام الموقع الحالي
