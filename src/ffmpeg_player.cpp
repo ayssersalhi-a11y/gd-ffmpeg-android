@@ -679,18 +679,33 @@ void FFmpegPlayer::_decode_next_frame() {
 }
 
 // ─── دفع الصوت ────────────────────────────────────────────────────────────────
-// [إصلاح A] لا نُعيّن position/audio_pts_offset إلا إذا كان audio_player يعمل
+//
+// [إصلاح H] الإصلاح الجذري لـ"الصوت السريع + التقطقة":
+//
+//  المشكلة السابقة:
+//    - عند 60fps، مساحة الـ Generator ≈ 735 عينة/frame
+//    - المُرمِّز يُخرج 1024 عينة/إطار
+//    - كنا ندفع min(1024, 735) = 735 عينة ونُهدر الـ 289 الباقية
+//    - النتيجة: نُهدر ~28% من الصوت كل frame → صوت أسرع
+//    - قطع الموجة المفاجئ عند الحذف → تقطقة (صوت البطارية)
+//
+//  الحل: audio_overflow — صندوق تخزين للعينات التي لم تتسع
+//    1. نُحوّل الإطار ونُخزّن الكل في overflow
+//    2. ندفع بقدر ما هناك مساحة
+//    3. ما تبقى يبقى في overflow للـ frame التالي
+//    4. لا نُهدر ولا عينة واحدة أبداً
+//
 void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!frame || !audio_player || !swr_ctx) return;
+    if (!audio_player || !swr_ctx) return;
 
     Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
     if (pb.is_null()) return;
 
-    // [إصلاح A] الشرط الجديد: فقط حين يعمل المشغل فعلياً
-    if (!audio_pts_set && frame->pts != AV_NOPTS_VALUE
+    // ── ضبط الساعة (فقط حين المشغل يعمل فعلاً) ─────────────────────────────
+    if (frame && !audio_pts_set && frame->pts != AV_NOPTS_VALUE
         && audio_stream_idx >= 0 && audio_player->is_playing()) {
+
         double frame_pts = frame->pts * av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
-        // تعويض start_time للصوت
         double astream_start = 0.0;
         if (fmt_ctx->streams[audio_stream_idx]->start_time != AV_NOPTS_VALUE)
             astream_start = fmt_ctx->streams[audio_stream_idx]->start_time
@@ -702,37 +717,62 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         UtilityFunctions::print("[AUDIO] Clock set. Offset=", audio_pts_offset);
     }
 
+    // ── تحويل الإطار الحالي وإضافة عيناته لـ audio_overflow ─────────────────
+    if (frame) {
+        int out_count = (int)av_rescale_rnd(
+            swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples,
+            audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
+
+        uint8_t *out_buf  = nullptr;
+        int      linesize = 0;
+        if (av_samples_alloc(&out_buf, &linesize, 2, out_count, AV_SAMPLE_FMT_FLT, 0) < 0)
+            return;
+
+        int converted = swr_convert(swr_ctx, &out_buf, out_count,
+                                    (const uint8_t **)frame->data, frame->nb_samples);
+
+        if (converted > 0) {
+            // حفظ جميع العينات في overflow بدون إهدار أي عينة
+            const float *src  = reinterpret_cast<const float *>(out_buf);
+            int          floats = converted * 2; // stereo: يمين + يسار
+            size_t old_sz = audio_overflow.size();
+
+            // حماية: لا ندع overflow يتجاوز 4 ثوانٍ (تجنب نمو لا نهائي عند توقف الدفع)
+            if (old_sz < (size_t)(audio_sample_rate * 2 * 4)) {
+                audio_overflow.resize(old_sz + floats);
+                memcpy(audio_overflow.data() + old_sz, src, floats * sizeof(float));
+            }
+        }
+
+        av_freep(&out_buf);
+    }
+
+    // ── دفع ما يتسع من audio_overflow للـ Generator ──────────────────────────
+    if (audio_overflow.empty()) return;
+
     int frames_available = pb->get_frames_available();
     if (frames_available <= 0) return;
 
-    int out_count = (int)av_rescale_rnd(
-        swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples,
-        audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
+    int overflow_frames = (int)(audio_overflow.size() / 2); // stereo frames
+    int to_push = Math::min(overflow_frames, frames_available);
+    if (to_push <= 0) return;
 
-    uint8_t *out_buf  = nullptr;
-    int      linesize = 0;
-    if (av_samples_alloc(&out_buf, &linesize, 2, out_count, AV_SAMPLE_FMT_FLT, 0) < 0)
-        return;
+    PackedVector2Array buffer;
+    buffer.resize(to_push);
+    Vector2      *wptr = buffer.ptrw();
+    const float  *src  = audio_overflow.data();
 
-    int converted = swr_convert(swr_ctx, &out_buf, out_count,
-                                (const uint8_t **)frame->data, frame->nb_samples);
-
-    if (converted > 0) {
-        int to_push = Math::min(converted, frames_available);
-        const float *samples = reinterpret_cast<const float *>(out_buf);
-        PackedVector2Array buffer;
-        buffer.resize(to_push);
-        Vector2 *wptr = buffer.ptrw();
-        for (int i = 0; i < to_push; i++) {
-            wptr[i] = Vector2(
-                CLAMP(samples[i * 2]     * volume, -1.0f, 1.0f),
-                CLAMP(samples[i * 2 + 1] * volume, -1.0f, 1.0f)
-            );
-        }
-        pb->push_buffer(buffer);
+    for (int i = 0; i < to_push; i++) {
+        wptr[i] = Vector2(
+            CLAMP(src[i * 2]     * volume, -1.0f, 1.0f),
+            CLAMP(src[i * 2 + 1] * volume, -1.0f, 1.0f)
+        );
     }
+    pb->push_buffer(buffer);
 
-    if (out_buf) av_freep(&out_buf);
+    // [مهم] احذف فقط ما دُفع — ما تبقى يبقى للـ frame التالي
+    int pushed_floats = to_push * 2;
+    audio_overflow.erase(audio_overflow.begin(), audio_overflow.begin() + pushed_floats);
 }
 
 // ─── إعداد الصوت ─────────────────────────────────────────────────────────────
@@ -766,7 +806,7 @@ bool FFmpegPlayer::_setup_audio(AVStream *astream) {
 
     if (!audio_generator.is_valid()) audio_generator.instantiate();
     audio_generator->set_mix_rate(audio_sample_rate);
-    audio_generator->set_buffer_length(0.5f);
+    audio_generator->set_buffer_length(2.0f); // [إصلاح H] 2s بدل 0.5s → هامش كافٍ
 
     if (audio_player) audio_player->set_stream(audio_generator);
     return true;
