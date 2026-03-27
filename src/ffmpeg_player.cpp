@@ -676,7 +676,7 @@ void FFmpegPlayer::_decode_next_frame() {
 //    3. ما تبقى يبقى في overflow للـ frame التالي
 //    4. لا نُهدر ولا عينة واحدة أبداً
 //
-func void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
+void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     if (!audio_player || !swr_ctx || !audio_codec_ctx) return;
 
     Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
