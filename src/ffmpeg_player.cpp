@@ -406,72 +406,53 @@ void FFmpegPlayer::seek(double seconds) {
 }
 
 // ─── _process ────────────────────────────────────────────────────────────────
-void FFmpegPlayer::_process(double delta) {
-    if (!fmt_ctx) return;
+func void FFmpegPlayer::_process(double delta) {
+    if (!fmt_ctx || !playing || buffering) return;
 
+    // 1. تحديث إحصائيات البافر لمعرفة هل نحتاج للتوقف (Underrun)
     _update_buffer_stats();
 
-    // [إصلاح D] hysteresis: بدء buffering عند 2s، استئناف عند 5s
-    if (playing && forward_buffer_secs < 2.0) {
-        playing   = false;
+    // 2. نظام الـ Hysteresis لمنع التقطيع المتكرر (Start @ 2s, Stop @ 5s)
+    if (forward_buffer_secs < 1.0) { // حد أمان منخفض جداً لبدء التخزين
+        playing = false;
         buffering = true;
-        if (audio_player && audio_player->is_playing())
-            audio_player->set_stream_paused(true);
-        if (is_inside_tree()) emit_signal("buffering_changed", true);
-        UtilityFunctions::printerr("[BUFFER] Underrun at ", position,
-                                   "s fwd=", forward_buffer_secs, "s");
-    }
-
-    if (buffering) {
-        _read_packets_to_queue();
-        _update_buffer_stats();
-        // استئناف فقط حين البافر يتجاوز 5s
-        if (forward_buffer_secs >= 5.0) {
-            buffering = false;
-            playing   = true;
-            if (audio_player) {
-                audio_player->set_stream_paused(false);
-                if (!audio_player->is_playing()) audio_player->play();
-            }
-            if (is_inside_tree()) emit_signal("buffering_changed", false);
-            UtilityFunctions::print("[BUFFER] Refilled to ", forward_buffer_secs,
-                                    "s. Resuming.");
-        }
+        if (audio_player) audio_player->set_stream_paused(true);
+        emit_signal("buffering_changed", true);
+        UtilityFunctions::print("[Buffer] Low buffer: ", forward_buffer_secs, "s. Pausing for refill...");
         return;
     }
 
-    if (!playing) return;
-
-    // ── [إصلاح G] Watchdog: إذا جفّ بافر الصوت وأوقفه Godot → نُعيده ─────────
-    // هذا يُصلح خطأ toggle_pause "Player is inactive" ويمنع تحول الساعة
-    // لـ delta-time (الذي يُسبب "الفيديو سريع" أو "الصوت سريع")
-    if (audio_stream_idx >= 0 && audio_player && !audio_player->is_playing()) {
-        // أعد تشغيل الصوت من الموقع الحالي
-        audio_pts_offset = position;
-        audio_pts_set    = false;
-        audio_player->play();
-        UtilityFunctions::print("[AUDIO] Watchdog restarted. pos=", position);
-    }
-
-    // تحديث الساعة المرجعية (دائماً من الصوت إذا كان يعمل)
+    // 3. تحديث الساعة المرجعية (Clock)
+    // نعتمد على موقع تشغيل الصوت في Godot + الإزاحة التي حسبناها عند أول إطار
     if (audio_stream_idx >= 0 && audio_player && audio_player->is_playing()) {
         double audio_time = audio_pts_offset + audio_player->get_playback_position();
-        // تصحيح ناعم — تجنب القفز المفاجئ
-        if (Math::abs(audio_time - position) > 1.0)
-            position = audio_time;               // مزامنة فورية إذا الفرق كبير
-        else
-            position = Math::lerp(position, audio_time, 0.3); // ناعمة عادةً
+        
+        // تصحيح ناعم (Interpolation) لمنع القفزات الحادة في الصورة
+        // إذا كان الفرق صغيراً، نستخدم lerp، إذا كان كبيراً (أكثر من ثانية) نقفز فوراً
+        if (Math::abs(audio_time - position) > 1.0) {
+            position = audio_time;
+        } else {
+            position = Math::lerp(position, audio_time, 0.2); 
+        }
     } else {
-        position += delta; // fallback نادر (فيديو بلا صوت)
+        // Fallback في حال عدم وجود صوت أو توقفه
+        position += delta;
     }
 
+    // 4. فك تشفير وعرض الإطارات بناءً على الساعة الجديدة
     _decode_next_frame();
 
+    // 5. التحقق من نهاية الملف
     if (duration > 0.0 && position >= duration) {
-        if (looping) seek(0.0);
-        else { stop(); _emit_video_finished(); }
+        if (looping) {
+            seek(0.0);
+        } else {
+            stop();
+            emit_signal("video_finished");
+        }
     }
 }
+
 
 // ─── حساب إحصاءات البافر ─────────────────────────────────────────────────────
 // [إصلاح A] نستخدم stream_start_time للتعويض الصحيح
@@ -695,84 +676,64 @@ void FFmpegPlayer::_decode_next_frame() {
 //    3. ما تبقى يبقى في overflow للـ frame التالي
 //    4. لا نُهدر ولا عينة واحدة أبداً
 //
-void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!audio_player || !swr_ctx) return;
+func void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
+    if (!audio_player || !swr_ctx || !audio_codec_ctx) return;
 
     Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
     if (pb.is_null()) return;
 
-    // ── ضبط الساعة (فقط حين المشغل يعمل فعلاً) ─────────────────────────────
-    if (frame && !audio_pts_set && frame->pts != AV_NOPTS_VALUE
-        && audio_stream_idx >= 0 && audio_player->is_playing()) {
-
-        double frame_pts = frame->pts * av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
-        double astream_start = 0.0;
-        if (fmt_ctx->streams[audio_stream_idx]->start_time != AV_NOPTS_VALUE)
-            astream_start = fmt_ctx->streams[audio_stream_idx]->start_time
-                            * av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
-
-        audio_pts_offset = frame_pts - astream_start;
-        audio_pts_set    = true;
-        position         = audio_pts_offset;
-        UtilityFunctions::print("[AUDIO] Clock set. Offset=", audio_pts_offset);
+    // 1. مزامنة الساعة (مرة واحدة عند البدء)
+    if (frame && !audio_pts_set && frame->pts != AV_NOPTS_VALUE && audio_player->is_playing()) {
+        double tb = av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
+        double vstart = (fmt_ctx->streams[audio_stream_idx]->start_time != AV_NOPTS_VALUE) ? 
+                         fmt_ctx->streams[audio_stream_idx]->start_time * tb : 0.0;
+        audio_pts_offset = (frame->pts * tb) - vstart;
+        audio_pts_set = true;
+        position = audio_pts_offset;
     }
 
-    // ── تحويل الإطار الحالي وإضافة عيناته لـ audio_overflow ─────────────────
+    // 2. معالجة وحقن العينات في الـ overflow
     if (frame) {
-        int out_count = (int)av_rescale_rnd(
-            swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples,
-            audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
+        int64_t delay = swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate);
+        int out_count = av_rescale_rnd(delay + frame->nb_samples, audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
 
-        uint8_t *out_buf  = nullptr;
-        int      linesize = 0;
-        if (av_samples_alloc(&out_buf, &linesize, 2, out_count, AV_SAMPLE_FMT_FLT, 0) < 0)
-            return;
-
-        int converted = swr_convert(swr_ctx, &out_buf, out_count,
-                                    (const uint8_t **)frame->data, frame->nb_samples);
-
-        if (converted > 0) {
-            // حفظ جميع العينات في overflow بدون إهدار أي عينة
-            const float *src  = reinterpret_cast<const float *>(out_buf);
-            int          floats = converted * 2; // stereo: يمين + يسار
-            size_t old_sz = audio_overflow.size();
-
-            // حماية: لا ندع overflow يتجاوز 4 ثوانٍ (تجنب نمو لا نهائي عند توقف الدفع)
-            if (old_sz < (size_t)(audio_sample_rate * 2 * 4)) {
-                audio_overflow.resize(old_sz + floats);
-                memcpy(audio_overflow.data() + old_sz, src, floats * sizeof(float));
+        uint8_t *out_buf = nullptr;
+        if (av_samples_alloc(&out_buf, nullptr, 2, out_count, AV_SAMPLE_FMT_FLT, 0) >= 0) {
+            int converted = swr_convert(swr_ctx, &out_buf, out_count, (const uint8_t **)frame->data, frame->nb_samples);
+            if (converted > 0) {
+                // حماية الذاكرة: إذا تضخم البافر (أكثر من 5 ثوانٍ)، نـنظفه فوراً لمنع التداخل
+                if (audio_overflow.size() > (size_t)(audio_sample_rate * 2 * 5)) {
+                    audio_overflow.clear();
+                }
+                size_t current_size = audio_overflow.size();
+                audio_overflow.resize(current_size + (converted * 2));
+                memcpy(audio_overflow.data() + current_size, out_buf, converted * 2 * sizeof(float));
             }
+            av_freep(&out_buf);
         }
-
-        av_freep(&out_buf);
     }
 
-    // ── دفع ما يتسع من audio_overflow للـ Generator ──────────────────────────
-    if (audio_overflow.empty()) return;
-
+    // 3. دفع البيانات لـ Godot (بذكاء)
     int frames_available = pb->get_frames_available();
-    if (frames_available <= 0) return;
+    int overflow_frames = (int)(audio_overflow.size() / 2);
 
-    int overflow_frames = (int)(audio_overflow.size() / 2); // stereo frames
-    int to_push = Math::min(overflow_frames, frames_available);
-    if (to_push <= 0) return;
+    // إذا كانت المساحة المتاحة صغيرة جداً (أقل من 256)، ننتظر الـ frame القادم
+    // هذا يمنع تقطعات "النقر" (Popping) الناتجة عن دفع بافرات صغيرة جداً
+    if (frames_available < 256 || overflow_frames <= 0) return;
 
+    int to_push = Math::min(frames_available, overflow_frames);
     PackedVector2Array buffer;
     buffer.resize(to_push);
-    Vector2      *wptr = buffer.ptrw();
-    const float  *src  = audio_overflow.data();
-
+    
+    Vector2 *wptr = buffer.ptrw();
+    const float *src = audio_overflow.data();
     for (int i = 0; i < to_push; i++) {
-        wptr[i] = Vector2(
-            CLAMP(src[i * 2]     * volume, -1.0f, 1.0f),
-            CLAMP(src[i * 2 + 1] * volume, -1.0f, 1.0f)
-        );
+        wptr[i] = Vector2(src[i * 2] * volume, src[i * 2 + 1] * volume);
     }
-    pb->push_buffer(buffer);
-
-    // [مهم] احذف فقط ما دُفع — ما تبقى يبقى للـ frame التالي
-    int pushed_floats = to_push * 2;
-    audio_overflow.erase(audio_overflow.begin(), audio_overflow.begin() + pushed_floats);
+    
+    if (pb->push_buffer(buffer)) {
+        audio_overflow.erase(audio_overflow.begin(), audio_overflow.begin() + (to_push * 2));
+    }
 }
 
 // ─── إعداد الصوت ─────────────────────────────────────────────────────────────
