@@ -542,15 +542,17 @@ void FFmpegPlayer::_prefill_buffers() {
 // ─── فك التشفير وعرض الإطار ─────────────────────────────────────────────────
 
 
+
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // أ- معالجة الصوت (تبقى كما هي لأنها تعمل جيداً عندك)
+    // 1. معالجة الصوت (تأكد أن السبيس كافٍ)
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         if (pb.is_valid()) {
             int space = pb->get_frames_available();
-            while (!audio_packet_queue.empty() && space > 512) {
+            // خفضنا الحد الأدنى للسحب لضمان عدم استهلاك المعالج كله في الصوت
+            while (!audio_packet_queue.empty() && space > 1024) {
                 AVPacket *a_pkt = audio_packet_queue.front();
                 if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
                     AVFrame *af = av_frame_alloc();
@@ -567,52 +569,69 @@ void FFmpegPlayer::_decode_next_frame() {
         }
     }
 
-    // ب- الفيديو: الإصلاح الجذري لمنع التجمد
     if (video_packet_queue.empty() || !video_codec_ctx) return;
 
+    // 2. إرسال الحزم للكودك (أقصى 2 حزمة في الدورة الواحدة لتخفيف العبء)
+    int sent_count = 0;
+    while (!video_packet_queue.empty() && sent_count < 2) {
+        AVPacket *pkt = video_packet_queue.front();
+        if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
+            video_packet_queue.pop_front();
+            av_packet_free(&pkt);
+            sent_count++;
+        } else {
+            break; 
+        }
+    }
+
+    // 3. استقبال الإطارات مع "تسامح" أكبر في المزامنة
     AVFrame *vf = av_frame_alloc();
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-    // 1. إرسال أكبر قدر ممكن من الحزم للكودك لتجنب الـ Underrun
-    while (!video_packet_queue.empty()) {
-        AVPacket *pkt = video_packet_queue.front();
-        int ret = avcodec_send_packet(video_codec_ctx, pkt);
-        if (ret == 0) {
-            video_packet_queue.pop_front();
-            av_packet_free(&pkt);
-        } else if (ret == AVERROR(EAGAIN)) {
-            break; // الكودك ممتلئ حالياً
-        } else {
-            video_packet_queue.pop_front();
-            av_packet_free(&pkt); // حزمة تالفة
-        }
-    }
-
-    // 2. سحب كافة الإطارات الجاهزة واختيار الأنسب
-    bool frame_updated = false;
     while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
-        double frame_pts = (vf->pts != AV_NOPTS_VALUE) ? (vf->pts * tb) - stream_start_time : position;
-        double diff = frame_pts - position;
+        double frame_pts = vf->pts * tb;
+        
+        // التعديل السحري هنا:
+        // السماح بتأخير يصل إلى 150ms قبل حذف الإطار (بدلاً من 40ms)
+        // هذا يمنع تجمد الصورة في حال كان المعالج بطيئاً
+        if (frame_pts < position - 0.15) {
+            av_frame_unref(vf);
+            continue; 
+        }
 
-        // إذا كان الإطار قريباً جداً من وقت الصوت (أو تجاوزه بقليل) نعرضه فوراً
-        if (diff >= -0.02 && diff <= 0.05) {
-            _update_texture_from_frame(vf);
-            frame_updated = true;
-        } 
-        // إذا كان الإطار قديم جداً، نتجاهله (Drop) ليكمل الكودك سحب الإطارات التالية
-        else if (diff < -0.02) {
+        // إطار مستقبلي بعيد، ننتظر
+        if (frame_pts > position + 0.1) {
             av_frame_unref(vf);
-            continue;
+            break;
         }
-        // إذا كان الإطار في المستقبل البعيد، نخرجه من الحلقة وننتظر الدورة القادمة
-        else if (diff > 0.05) {
-            av_frame_unref(vf);
-            break; 
+
+        // تحويل وعرض الإطار
+        if (!sws_ctx) {
+            sws_ctx = sws_getContext(video_width, video_height, (AVPixelFormat)vf->format,
+                                     video_width, video_height, AV_PIX_FMT_RGB24,
+                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         }
+
+        uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
+        int dest_linesize[4] = { video_width * 3, 0, 0, 0 };
+        sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, dest, dest_linesize);
+
+        PackedByteArray pba;
+        pba.resize(video_width * video_height * 3);
+        memcpy(pba.ptrw(), frame_buffer, pba.size());
+
+        Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+        if (current_texture.is_valid()) {
+            current_texture->update(img);
+        }
+        _emit_frame_updated();
+        
         av_frame_unref(vf);
+        break; // عرضنا إطاراً واحداً، نخرج لنعطي فرصة للمعالج
     }
     av_frame_free(&vf);
 }
+
 
 
 void FFmpegPlayer::_update_texture_from_frame(AVFrame *frame) {
