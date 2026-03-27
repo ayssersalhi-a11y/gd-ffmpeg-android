@@ -442,29 +442,29 @@ void FFmpegPlayer::_process(double delta) {
 
 
 // ─── حساب إحصاءات البافر ─────────────────────────────────────────────────────
-// [إصلاح A] نستخدم stream_start_time للتعويض الصحيح
 void FFmpegPlayer::_update_buffer_stats() {
     if (video_stream_idx < 0 || !fmt_ctx) return;
 
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+    double vstream_start = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE) 
+                            ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
-    // start_time من stream نفسها (أكثر دقة)
-    double vstream_start = 0.0;
-    if (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
-        vstream_start = fmt_ctx->streams[video_stream_idx]->start_time * tb;
-
-    double fwd = 0.0, bck = 0.0;
-    for (AVPacket *pkt : video_packet_queue) {
-        if (pkt->pts == AV_NOPTS_VALUE) continue;
-        // تحويل PTS إلى ثواني حقيقية (مع تعويض start_time)
-        double pts = (pkt->pts * tb) - vstream_start;
-        double diff = pts - position;
-        if (diff >= 0.0) fwd = Math::max(fwd, diff);
-        else             bck = Math::max(bck, -diff);
+    double fwd = 0.0;
+    if (video_packet_queue.empty()) {
+        forward_buffer_secs = 0.0;
+    } else {
+        AVPacket *last_pkt = video_packet_queue.back();
+        if (last_pkt->pts != AV_NOPTS_VALUE) {
+            double last_pts = (last_pkt->pts * tb) - vstream_start;
+            fwd = last_pts - position;
+        }
+        forward_buffer_secs = Math::max(0.0, fwd);
     }
-    forward_buffer_secs = fwd;
-    back_buffer_secs    = bck;
+    
+    // حساب بافر الخلف (اختياري، لا يؤثر على التشغيل)
+    back_buffer_secs = 0.0; 
 }
+
 
 // ─── حذف حزم الخلف الزائدة ───────────────────────────────────────────────────
 void FFmpegPlayer::_trim_back_buffer() {
@@ -542,11 +542,10 @@ void FFmpegPlayer::_prefill_buffers() {
 // ─── فك التشفير وعرض الإطار ─────────────────────────────────────────────────
 
 
-
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // أ- الصوت: دفع أكبر قدر ممكن
+    // أ- معالجة الصوت (تبقى كما هي لأنها تعمل جيداً عندك)
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         if (pb.is_valid()) {
@@ -568,40 +567,49 @@ void FFmpegPlayer::_decode_next_frame() {
         }
     }
 
-    // ب- الفيديو: فك تشفير متعدد لحل مشكلة "الصورة السريعة"
+    // ب- الفيديو: الإصلاح الجذري لمنع التجمد
     if (video_packet_queue.empty() || !video_codec_ctx) return;
 
     AVFrame *vf = av_frame_alloc();
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
 
-    // سحب حزمة واحدة وإرسالها
-    AVPacket *pkt = video_packet_queue.front();
-    if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
-        video_packet_queue.pop_front();
-        av_packet_free(&pkt);
+    // 1. إرسال أكبر قدر ممكن من الحزم للكودك لتجنب الـ Underrun
+    while (!video_packet_queue.empty()) {
+        AVPacket *pkt = video_packet_queue.front();
+        int ret = avcodec_send_packet(video_codec_ctx, pkt);
+        if (ret == 0) {
+            video_packet_queue.pop_front();
+            av_packet_free(&pkt);
+        } else if (ret == AVERROR(EAGAIN)) {
+            break; // الكودك ممتلئ حالياً
+        } else {
+            video_packet_queue.pop_front();
+            av_packet_free(&pkt); // حزمة تالفة
+        }
     }
 
-    // استقبال كافة الإطارات المتاحة في الكودك (لحفظ الوقت)
+    // 2. سحب كافة الإطارات الجاهزة واختيار الأنسب
+    bool frame_updated = false;
     while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
         double frame_pts = (vf->pts != AV_NOPTS_VALUE) ? (vf->pts * tb) - stream_start_time : position;
         double diff = frame_pts - position;
 
-        if (diff < -0.01) { 
-            // الإطار متأخر جداً، ارميه واسحب التالي بسرعة (Frame Dropping)
-            av_frame_unref(vf);
-            continue; 
-        } 
-        else if (diff <= 0.04) { 
-            // الإطار في وقته (هامش 40ms)، اعرضه واخرج
+        // إذا كان الإطار قريباً جداً من وقت الصوت (أو تجاوزه بقليل) نعرضه فوراً
+        if (diff >= -0.02 && diff <= 0.05) {
             _update_texture_from_frame(vf);
+            frame_updated = true;
+        } 
+        // إذا كان الإطار قديم جداً، نتجاهله (Drop) ليكمل الكودك سحب الإطارات التالية
+        else if (diff < -0.02) {
+            av_frame_unref(vf);
+            continue;
+        }
+        // إذا كان الإطار في المستقبل البعيد، نخرجه من الحلقة وننتظر الدورة القادمة
+        else if (diff > 0.05) {
             av_frame_unref(vf);
             break; 
-        } 
-        else {
-            // الإطار في المستقبل، احتفظ به في الكودك للدورة القادمة
-            av_frame_unref(vf);
-            break;
         }
+        av_frame_unref(vf);
     }
     av_frame_free(&vf);
 }
