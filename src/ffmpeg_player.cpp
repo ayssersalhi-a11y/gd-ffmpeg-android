@@ -275,9 +275,14 @@ void FFmpegPlayer::play() {
     buffering = false;
 
     if (audio_player) {
-        // [إصلاح C] تشغيل الصوت من البداية دائماً — يُصلح toggle_pause error
-        if (!audio_player->is_playing()) audio_player->play();
+        // [إصلاح G] نوقف أولاً ثم نشغّل دائماً — هذا يضمن أن
+        // stream_playbacks غير فارغة → get_stream_playback() لا يفشل أبداً
+        if (audio_player->is_playing()) audio_player->stop();
+        audio_player->play();
         audio_player->set_stream_paused(false);
+        // إعادة ضبط الساعة لأن play() يُصفّر get_playback_position()
+        audio_pts_offset = position;
+        audio_pts_set    = false;
     }
     UtilityFunctions::print("[PLAY] Started. pos=", position,
                             " fwd=", forward_buffer_secs, "s");
@@ -437,15 +442,27 @@ void FFmpegPlayer::_process(double delta) {
 
     if (!playing) return;
 
-    // تحديث الساعة المرجعية
+    // ── [إصلاح G] Watchdog: إذا جفّ بافر الصوت وأوقفه Godot → نُعيده ─────────
+    // هذا يُصلح خطأ toggle_pause "Player is inactive" ويمنع تحول الساعة
+    // لـ delta-time (الذي يُسبب "الفيديو سريع" أو "الصوت سريع")
+    if (audio_stream_idx >= 0 && audio_player && !audio_player->is_playing()) {
+        // أعد تشغيل الصوت من الموقع الحالي
+        audio_pts_offset = position;
+        audio_pts_set    = false;
+        audio_player->play();
+        UtilityFunctions::print("[AUDIO] Watchdog restarted. pos=", position);
+    }
+
+    // تحديث الساعة المرجعية (دائماً من الصوت إذا كان يعمل)
     if (audio_stream_idx >= 0 && audio_player && audio_player->is_playing()) {
         double audio_time = audio_pts_offset + audio_player->get_playback_position();
-        if (Math::abs(audio_time - position) > 0.5)
-            position = audio_time;
+        // تصحيح ناعم — تجنب القفز المفاجئ
+        if (Math::abs(audio_time - position) > 1.0)
+            position = audio_time;               // مزامنة فورية إذا الفرق كبير
         else
-            position = Math::lerp(position, audio_time, 0.5);
+            position = Math::lerp(position, audio_time, 0.3); // ناعمة عادةً
     } else {
-        position += delta;
+        position += delta; // fallback نادر (فيديو بلا صوت)
     }
 
     _decode_next_frame();
@@ -536,7 +553,9 @@ void FFmpegPlayer::_read_packets_to_queue() {
 }
 
 // ─── ملء أولي ─────────────────────────────────────────────────────────────────
-// [إصلاح A] لا نُعيّن position من الصوت هنا — audio_player لا يعمل بعد
+// [إصلاح F] لا نُفكّك أي صوت هنا إطلاقاً — swr_ctx يجب أن يبقى نظيفاً
+// السبب: لو مررنا إطارات صوتية عبر swr_ctx هنا، يتراكم فيه delay داخلي،
+//         فعند التشغيل الفعلي يُخرج عينات مضاعفة → صوت أسرع من الحقيقي
 void FFmpegPlayer::_prefill_buffers() {
     if (!fmt_ctx) return;
     UtilityFunctions::print("[PREFILL] Filling to ", INITIAL_PLAY, "s...");
@@ -547,25 +566,7 @@ void FFmpegPlayer::_prefill_buffers() {
         _update_buffer_stats();
         attempts++;
     }
-
-    // فك تشفير صوت مبدئي — بدون تعيين position (audio_player غير شغّال)
-    if (audio_codec_ctx) {
-        int cnt = 0;
-        while (!audio_packet_queue.empty() && cnt < 20) {
-            AVPacket *p = audio_packet_queue.front();
-            if (avcodec_send_packet(audio_codec_ctx, p) == 0) {
-                AVFrame *af = av_frame_alloc();
-                while (avcodec_receive_frame(audio_codec_ctx, af) == 0) {
-                    _push_audio_samples(af); // لن يُعيّن position لأن is_playing()=false
-                    av_frame_unref(af);
-                }
-                av_frame_free(&af);
-            }
-            audio_packet_queue.pop_front();
-            av_packet_free(&p);
-            cnt++;
-        }
-    }
+    // الصوت يُفكَّك فقط بعد audio_player->play() في _decode_next_frame
 
     UtilityFunctions::print("[PREFILL] Done. Forward=", forward_buffer_secs, "s");
 }
