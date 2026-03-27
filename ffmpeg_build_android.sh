@@ -1,10 +1,15 @@
 #!/bin/bash
-# ffmpeg_build_android.sh
-# يعمل محلياً وفي GitHub Actions - تم التعديل لدعم MediaCodec (العتاد)
+# ffmpeg_build_android.sh  (v2.0 - Fixed)
+#
+# الإصلاحات:
+#  - [حرج] حذف --enable-hwaccel=vp8_mediacodec و vp9_mediacodec
+#          (هذان الخياران غير موجودَين في FFmpeg — يُسببان فشل configure)
+#  - إضافة --enable-protocol=http,https,hls,tls لدعم البث من الإنترنت
+#  - إضافة --enable-demuxer=hls,concat لدعم m3u8
+#  - إضافة --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb للبث
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-# ── الإعدادات: تأتي من متغيرات البيئة أو القيم الافتراضية ───────────────────
 NDK_PATH="${NDK_PATH:-${HOME}/android-ndk-r26c}"
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/ffmpeg-android}"
@@ -12,14 +17,14 @@ API_LEVEL="${API_LEVEL:-24}"
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
-echo "║  بناء FFmpeg ${FFMPEG_VERSION} لـ Android (HW Support)  ║"
+echo "║  بناء FFmpeg ${FFMPEG_VERSION} لـ Android (v2.0-Fixed)  ║"
 echo "╚══════════════════════════════════════════════╝"
 echo "  NDK_PATH   : ${NDK_PATH}"
 echo "  OUTPUT_DIR : ${OUTPUT_DIR}"
 echo "  API Level  : ${API_LEVEL}"
 echo ""
 
-# ── تحميل FFmpeg إذا لم يوجد ─────────────────────────────────────────────────
+# ── تحميل FFmpeg ─────────────────────────────────────────────────────────────
 FFMPEG_SRC="ffmpeg-${FFMPEG_VERSION}"
 if [ ! -d "${FFMPEG_SRC}" ]; then
     echo "── تحميل FFmpeg ${FFMPEG_VERSION} ──"
@@ -84,14 +89,11 @@ build_abi() {
         \
         --enable-jni \
         --enable-mediacodec \
+        \
         --enable-decoder=h264_mediacodec \
         --enable-decoder=hevc_mediacodec \
         --enable-decoder=vp8_mediacodec \
         --enable-decoder=vp9_mediacodec \
-        --enable-hwaccel=h264_mediacodec \
-        --enable-hwaccel=hevc_mediacodec \
-        --enable-hwaccel=vp8_mediacodec \
-        --enable-hwaccel=vp9_mediacodec \
         \
         --enable-decoder=h264 \
         --enable-decoder=hevc \
@@ -109,13 +111,28 @@ build_abi() {
         --enable-demuxer=matroska \
         --enable-demuxer=mov \
         --enable-demuxer=avi \
+        --enable-demuxer=hls \
+        --enable-demuxer=concat \
         \
         --enable-parser=h264 \
         --enable-parser=hevc \
         --enable-parser=aac \
+        --enable-parser=opus \
         \
         --enable-protocol=file \
         --enable-protocol=pipe \
+        --enable-protocol=http \
+        --enable-protocol=https \
+        --enable-protocol=hls \
+        --enable-protocol=tcp \
+        --enable-protocol=tls \
+        --enable-protocol=crypto \
+        \
+        --enable-bsf=h264_mp4toannexb \
+        --enable-bsf=hevc_mp4toannexb \
+        --enable-bsf=aac_adtstoasc \
+        \
+        --enable-openssl \
         \
         --extra-cflags="-Os -fPIC -fvisibility=hidden" \
         --extra-ldflags="-Wl,--gc-sections"
@@ -129,8 +146,8 @@ build_abi() {
 }
 
 # ── التنفيذ ───────────────────────────────────────────────────────────────────
-build_abi "arm64-v8a" "aarch64" "armv8-a" "aarch64-linux-android"
-build_abi "armeabi-v7a" "arm" "armv7-a" "armv7a-linux-androideabi"
+build_abi "arm64-v8a"   "aarch64" "armv8-a" "aarch64-linux-android"
+build_abi "armeabi-v7a" "arm"     "armv7-a" "armv7a-linux-androideabi"
 
 echo ""
 echo "✓ FFmpeg 64-bit: ${OUTPUT_DIR}/arm64-v8a/lib/"
@@ -138,3 +155,9 @@ ls -lh "${OUTPUT_DIR}/arm64-v8a/lib/"
 
 echo "✓ FFmpeg 32-bit: ${OUTPUT_DIR}/armeabi-v7a/lib/"
 ls -lh "${OUTPUT_DIR}/armeabi-v7a/lib/"
+
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║  ✓ FFmpeg Build Complete (v2.0)      ║"
+echo "║  Includes: MediaCodec + HTTP + HLS   ║"
+echo "╚══════════════════════════════════════╝"
