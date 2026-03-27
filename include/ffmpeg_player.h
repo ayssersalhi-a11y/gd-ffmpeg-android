@@ -1,14 +1,7 @@
 /**
  * ffmpeg_player.h
  * GDExtension - FFmpeg Video + Audio Player for Godot 4 (Android ARM64/ARM32)
- *
- * الإصدار: 2.0 - نظام بث احترافي مع Buffer ديناميكي + Seek ذكي
- *
- * الإصلاحات:
- *  - إزالة هيدر mediacodec.h غير الموجود في FFmpeg 7.0
- *  - إضافة متغيرات Buffer الديناميكي (أمام + خلف)
- *  - إضافة دعم البث من الإنترنت (HTTP/HTTPS/HLS)
- *  - إضافة دعم Seek الذكي داخل/خارج البافر
+ * * الإصدار 2.2 — تحديث شامل لنظام المزامنة ومنع تداخل الأصوات
  */
 
 #pragma once
@@ -35,6 +28,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
+#include <libavutil/mathematics.h>
 }
 
 namespace godot {
@@ -80,9 +74,9 @@ protected:
 
 private:
     // ── FFmpeg: سياق الملف والفيديو ──────────────────────────────────────────
-    AVFormatContext *fmt_ctx        = nullptr;
-    AVCodecContext  *video_codec_ctx = nullptr;
-    SwsContext      *sws_ctx        = nullptr;
+    AVFormatContext *fmt_ctx          = nullptr;
+    AVCodecContext  *video_codec_ctx  = nullptr;
+    SwsContext      *sws_ctx          = nullptr;
     int              video_stream_idx = -1;
 
     int    video_width  = 0;
@@ -93,11 +87,11 @@ private:
     Ref<ImageTexture> current_texture;
 
     // ── FFmpeg: سياق الصوت ───────────────────────────────────────────────────
-    AVCodecContext *audio_codec_ctx  = nullptr;
-    SwrContext     *swr_ctx          = nullptr;
-    int             audio_stream_idx = -1;
-    int             audio_sample_rate = 0;
-    int             audio_channels   = 2;
+    AVCodecContext *audio_codec_ctx   = nullptr;
+    SwrContext     *swr_ctx           = nullptr;
+    int             audio_stream_idx  = -1;
+    int             audio_sample_rate = 44100;
+    int             audio_channels    = 2;
 
     // ── Godot Audio ───────────────────────────────────────────────────────────
     AudioStreamPlayer         *audio_player    = nullptr;
@@ -106,7 +100,6 @@ private:
     // ── طوابير الحزم ─────────────────────────────────────────────────────────
     std::list<AVPacket*> video_packet_queue;
     std::list<AVPacket*> audio_packet_queue;
-    const int MAX_QUEUE_SIZE = 600;
 
     // ── حالة التشغيل ─────────────────────────────────────────────────────────
     bool   playing      = false;
@@ -117,28 +110,26 @@ private:
     double position     = 0.0;
     bool   is_streaming = false;
 
-    // إزاحة start_time للملف (يُعوّض عنها في حسابات PTS)
+    // إزاحة start_time للملف
     double stream_start_time = 0.0;
 
     // ── نظام البافر الديناميكي ────────────────────────────────────────────────
-    double forward_buffer_secs = 0.0;   // بالثواني: كم لدينا أمام الموقع الحالي
-    double back_buffer_secs    = 0.0;   // بالثواني: كم لدينا خلف الموقع الحالي
+    double forward_buffer_secs = 0.0;
+    double back_buffer_secs    = 0.0;
 
-    const double MAX_FORWARD   = 40.0;  // حد أقصى للبافر الأمامي
-    const double MIN_FORWARD   = 20.0;  // حد أدنى (نبدأ التحميل الكثيف تحته)
-    const double INITIAL_PLAY  = 5.0;   // ثواني مطلوبة قبل بدء التشغيل
-    const double MAX_BACK      = 60.0;  // حد أقصى للبافر الخلفي
+    const double MAX_FORWARD   = 40.0;
+    const double MIN_FORWARD   = 20.0;
+    const double INITIAL_PLAY  = 5.0;
+    const double MAX_BACK      = 60.0;
 
     // ── مزامنة الصوت والصورة ─────────────────────────────────────────────────
     double audio_pts_offset = 0.0;
     bool   audio_pts_set    = false;
 
-    // [إصلاح H] بافر الفائض — يحفظ العينات التي لم تتسع في الـ Generator
-    // بدون هذا نُهدر نحو 28% من عينات الصوت كل frame → صوت سريع + تقطقة
+    // بافر الفائض للصوت (مهم جداً للاستقرار)
     std::vector<float> audio_overflow;
 
-    // ── أزرار مساعدة داخلية ──────────────────────────────────────────────────
-    double _get_packet_pts_seconds(AVPacket *pkt, int stream_idx) const;
+    // ── الدوال المساعدة الداخلية ─────────────────────────────────────────────
     void   _update_buffer_stats();
     void   _trim_back_buffer();
     int    _calc_read_batch_size() const;
@@ -147,12 +138,17 @@ private:
     void _read_packets_to_queue();
     void _prefill_buffers();
     void _decode_next_frame();
+    
+    // الدالة الجديدة لتحديث الـ Texture
+    void _update_texture_from_frame(AVFrame *frame);
+    
     void _push_audio_samples(AVFrame *frame);
     void _clear_queues();
     void _cleanup();
     void _allocate_buffers();
     void _clear_audio_buffers();
 
+    // ── الإشارات (Signals) ────────────────────────────────────────────────────
     void _emit_video_loaded(bool success);
     void _emit_video_finished();
     void _emit_frame_updated();
