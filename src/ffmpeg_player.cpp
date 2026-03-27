@@ -409,11 +409,10 @@ void FFmpegPlayer::seek(double seconds) {
 void FFmpegPlayer::_process(double delta) {
     if (!fmt_ctx || !playing || buffering) return;
 
-    // 1. تحديث إحصائيات البافر
     _update_buffer_stats();
 
-    // 2. نظام الـ Hysteresis (الأمان)
-    if (forward_buffer_secs < 1.0) {
+    // خفضنا حد التوقف ليكون 0.5 ثانية بدل 1.0 لزيادة الاستمرارية
+    if (forward_buffer_secs < 0.5) {
         playing = false;
         buffering = true;
         if (audio_player) audio_player->set_stream_paused(true);
@@ -421,29 +420,25 @@ void FFmpegPlayer::_process(double delta) {
         return;
     }
 
-    // 3. تحديث الساعة المرجعية (Master Clock)
     if (audio_stream_idx >= 0 && audio_player && audio_player->is_playing()) {
         double audio_time = audio_pts_offset + audio_player->get_playback_position();
         
-        // تصحيح ناعم جداً (0.05 بدل 0.2) لمنع التشنج في الصورة
-        if (Math::abs(audio_time - position) > 1.0) {
-            position = audio_time; // قفزة ضرورية في حال desync كبير
-        } else {
-            position = Math::lerp(position, audio_time, 0.05); 
+        // بدلاً من lerp المستمر، نحدث الموقع مباشرة فقط إذا كان الفرق مؤثراً (> 10ms)
+        if (Math::abs(audio_time - position) > 0.01) {
+            position = audio_time;
         }
     } else {
         position += delta;
     }
 
-    // 4. معالجة الإطارات
     _decode_next_frame();
 
-    // 5. التحقق من النهاية
     if (duration > 0.0 && position >= duration) {
         if (looping) { seek(0.0); } 
         else { stop(); _emit_video_finished(); }
     }
 }
+
 
 
 // ─── حساب إحصاءات البافر ─────────────────────────────────────────────────────
@@ -547,10 +542,11 @@ void FFmpegPlayer::_prefill_buffers() {
 // ─── فك التشفير وعرض الإطار ─────────────────────────────────────────────────
 
 
+
 void FFmpegPlayer::_decode_next_frame() {
     _read_packets_to_queue();
 
-    // أ- معالجة الصوت (دفع الحزم المتاحة)
+    // أ- الصوت: دفع أكبر قدر ممكن
     if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
         Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
         if (pb.is_valid()) {
@@ -572,41 +568,37 @@ void FFmpegPlayer::_decode_next_frame() {
         }
     }
 
-    // ب- معالجة الفيديو (التزامن الدقيق)
+    // ب- الفيديو: فك تشفير متعدد لحل مشكلة "الصورة السريعة"
     if (video_packet_queue.empty() || !video_codec_ctx) return;
 
     AVFrame *vf = av_frame_alloc();
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-    bool frame_displayed = false;
 
-    // إرسال الحزمة التالية للكودك إذا كان مستعداً
-    if (!video_packet_queue.empty()) {
-        AVPacket *pkt = video_packet_queue.front();
-        if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
-            video_packet_queue.pop_front();
-            av_packet_free(&pkt);
-        }
+    // سحب حزمة واحدة وإرسالها
+    AVPacket *pkt = video_packet_queue.front();
+    if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
+        video_packet_queue.pop_front();
+        av_packet_free(&pkt);
     }
 
-    // استقبال الإطارات وفلترتها حسب الوقت
+    // استقبال كافة الإطارات المتاحة في الكودك (لحفظ الوقت)
     while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
         double frame_pts = (vf->pts != AV_NOPTS_VALUE) ? (vf->pts * tb) - stream_start_time : position;
         double diff = frame_pts - position;
 
-        if (diff < -0.05) { 
-            // الإطار قديم (تأخرنا)، نتجاهله ونبحث عن التالي فوراً
+        if (diff < -0.01) { 
+            // الإطار متأخر جداً، ارميه واسحب التالي بسرعة (Frame Dropping)
             av_frame_unref(vf);
             continue; 
         } 
-        else if (diff <= 0.03) { 
-            // الإطار في وقته المناسب (أو قريب جداً)، نعرضه
+        else if (diff <= 0.04) { 
+            // الإطار في وقته (هامش 40ms)، اعرضه واخرج
             _update_texture_from_frame(vf);
-            frame_displayed = true;
             av_frame_unref(vf);
-            break; // نكتفي بإطار واحد في هذه الدورة
+            break; 
         } 
         else {
-            // الإطار في المستقبل، نتوقف ولا نسحب المزيد من الكودك
+            // الإطار في المستقبل، احتفظ به في الكودك للدورة القادمة
             av_frame_unref(vf);
             break;
         }
@@ -616,23 +608,32 @@ void FFmpegPlayer::_decode_next_frame() {
 
 
 void FFmpegPlayer::_update_texture_from_frame(AVFrame *frame) {
-    if (!sws_ctx || !frame_buffer) return;
+    // 1. التحقق من سلامة البافرات قبل العمل
+    if (!sws_ctx || !frame_buffer || !frame) return;
 
+    // 2. إعداد مصفوفات الوجهة لعملية التحويل (Scaling/Conversion)
     uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
     int dest_linesize[4] = { video_width * 3, 0, 0, 0 };
     
+    // 3. تحويل الإطار من صيغة الكودك (غالباً YUV) إلى RGB24 التي يطلبها Godot
     sws_scale(sws_ctx, frame->data, frame->linesize, 0, video_height, dest, dest_linesize);
 
+    // 4. نقل البيانات إلى مصفوفة بايتات Godot
     PackedByteArray pba;
     pba.resize(video_width * video_height * 3);
+    
+    // استخدام memcpy سريع جداً لنقل البيانات
     memcpy(pba.ptrw(), frame_buffer, pba.size());
 
+    // 5. تحديث الصورة الموجودة فعلياً بدلاً من إنشاء واحدة جديدة في كل فريم (لتحسين الأداء)
     Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
+    
     if (current_texture.is_valid()) {
         current_texture->update(img);
-        _emit_frame_updated();
+        _emit_frame_updated(); // إرسال إشارة للمحرك بأن الصورة تغيرت
     }
 }
+
 
 
 // ─── دفع الصوت ────────────────────────────────────────────────────────────────
@@ -643,7 +644,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
     Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
     if (pb.is_null()) return;
 
-    // 1. مزامنة الساعة عند أول إطار صوتي حقيقي
     if (frame && !audio_pts_set && frame->pts != AV_NOPTS_VALUE && audio_player->is_playing()) {
         double tb = av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
         double vstart = (fmt_ctx->streams[audio_stream_idx]->start_time != AV_NOPTS_VALUE) ? 
@@ -653,7 +653,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         position = audio_pts_offset;
     }
 
-    // 2. تحويل وتخزين في الـ Overflow
     if (frame) {
         int out_count = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, 
                                        audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
@@ -661,10 +660,6 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         if (av_samples_alloc(&out_buf, nullptr, 2, out_count, AV_SAMPLE_FMT_FLT, 0) >= 0) {
             int converted = swr_convert(swr_ctx, &out_buf, out_count, (const uint8_t **)frame->data, frame->nb_samples);
             if (converted > 0) {
-                // حد أقصى للبافر 3 ثوانٍ لمنع تراكم الذاكرة في الهواتف الضعيفة
-                if (audio_overflow.size() > (size_t)(audio_sample_rate * 2 * 3)) {
-                    audio_overflow.clear();
-                }
                 size_t old_sz = audio_overflow.size();
                 audio_overflow.resize(old_sz + (converted * 2));
                 memcpy(audio_overflow.data() + old_sz, out_buf, converted * 2 * sizeof(float));
@@ -673,11 +668,11 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         }
     }
 
-    // 3. الدفع لـ Godot
     int frames_available = pb->get_frames_available();
     int overflow_frames = (int)(audio_overflow.size() / 2);
 
-    if (frames_available > 512 && overflow_frames > 0) {
+    // سحب العينات بهدوء دون مسح البافر بالكامل إذا كان هناك نقص
+    if (frames_available > 0 && overflow_frames > 0) {
         int to_push = Math::min(frames_available, overflow_frames);
         PackedVector2Array buffer;
         buffer.resize(to_push);
@@ -693,6 +688,7 @@ void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
         }
     }
 }
+
 
 
 // ─── إعداد الصوت ─────────────────────────────────────────────────────────────
