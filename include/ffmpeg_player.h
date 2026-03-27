@@ -23,6 +23,7 @@
 #include <godot_cpp/core/class_db.hpp>
 
 #include <list>
+#include <vector>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -131,6 +132,10 @@ private:
     // ── مزامنة الصوت والصورة ─────────────────────────────────────────────────
     double audio_pts_offset = 0.0;
     bool   audio_pts_set    = false;
+
+    // [إصلاح H] بافر الفائض — يحفظ العينات التي لم تتسع في الـ Generator
+    // بدون هذا نُهدر نحو 28% من عينات الصوت كل frame → صوت سريع + تقطقة
+    std::vector<float> audio_overflow;
 
     // ── أزرار مساعدة داخلية ──────────────────────────────────────────────────
     double _get_packet_pts_seconds(AVPacket *pkt, int stream_idx) const;
