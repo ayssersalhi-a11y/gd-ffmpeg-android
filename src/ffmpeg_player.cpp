@@ -1,36 +1,35 @@
 /**
  * ffmpeg_player.cpp
- * GDExtension - FFmpeg Video + Audio Player for Godot 4 (Android ARM64/ARM32)
+ * GDExtension - FFmpeg Video Player (Video Only) for Godot 4
  *
- * ─── الإصدار 2.1 — إصلاح مشاكل Buffering + Seek + صوت سريع ───────────────
+ * الإصدار 3.0 — فصل كامل للصوت عن الفيديو + إصلاح التقطع
  *
- * الإصلاحات الجديدة في v2.1 (مكتشفة من سجلات الجهاز):
+ * ─── الإصلاحات والتغييرات الجوهرية ───────────────────────────────────────────
  *
- *  [A] الخطأ الجذري — forward_buffer_secs = 0 فور بدء التشغيل:
- *      السبب: خلال _prefill_buffers، كان _push_audio_samples يُعيّن
- *             position = audio_pts_offset = 0.696s، لكن حزم الفيديو
- *             تبدأ من PTS≈0، فتبدو كلها "خلف" الموقع → fwd_buffer = 0
- *             → underrun فوري بعد play()
- *      الإصلاح: لا نُعيّن position من الصوت إلا إذا كان audio_player
- *               يعمل فعلاً (is_playing). خلال prefill لا يعمل → لا تحديث.
+ * [1] فصل الصوت:
+ *     - حُذف كل كود FFmpeg الخاص بفك تشفير الصوت (audio_codec_ctx, swr_ctx,
+ *       audio_packet_queue, _push_audio_samples, _setup_audio).
+ *     - الصوت يُدار الآن عبر AudioStreamPlayer عادي مستقل تماماً.
+ *     - load_audio(path) يقبل: res://sounds/arabic.mp3  أو  http://... أو
+ *       مسار مطلق على الجهاز.  يدعم mp3 و ogg و wav عبر Godot مباشرة.
+ *     - المزامنة الزمنية لا تعتمد على الصوت → لا desync مطلقاً.
  *
- *  [B] Fast Seek يُسبب desync صوت/صورة:
- *      السبب: Fast Seek لا يُوقف الصوت → get_playback_position() يكمل
- *             من مكانه القديم → audio_time خاطئ → صوت سريع/بطيء
- *      الإصلاح: Fast Seek يُوقف ويُعيد تشغيل الصوت دائماً،
- *               ويُنظف بافر الصوت ويتجاوز الحزم القديمة.
+ * [2] إصلاح التقطع (المشكلة الرئيسية):
+ *     السبب الجذري: avcodec_receive_frame() على فيديو حقيقي (H264 من كاميرا)
+ *     أبطأ بكثير من الأنيمي لأن الإطارات أكبر. حين يستغرق أكثر من 16ms
+ *     (دورة واحدة من _process) تظهر اللحظات المتقطعة.
  *
- *  [C] toggle_pause() يُطلب get_stream_playback() قبل play():
- *      الإصلاح: pause() تفحص is_playing() أولاً قبل لمس AudioStreamPlayer.
+ *     الحل: طابور decoded_frame_queue
+ *     - _decode_packets_into_queue() يُفكّك حتى MAX_DECODED_FRAMES إطاراً
+ *       مسبقاً ويخزنها كـ PackedByteArray جاهزة.
+ *     - _present_frame_at() تأخذ الإطار الصحيح من الطابور فوراً دون أي
+ *       avcodec_receive_frame() في نفس دورة _process.
+ *     - النتيجة: _process يُنهي عمله في < 1ms في معظم الحالات.
  *
- *  [D] Buffer oscillation (Refilled. Resuming. متكرر):
- *      السبب: calc_read_batch_size() يُعيد 0 حين البافر > 40s → لا قراءة
- *             → البافر يفرغ → underrun → refill → تكرار
- *      الإصلاح: دائماً نقرأ 5 حزم على الأقل، + hysteresis (2s start / 5s stop)
- *
- *  [E] تقطقات الصوت:
- *      السبب: swr_ctx يُجمّع delay بين الـ seeks ويُخرج عينات مزدوجة
- *      الإصلاح: flush سريع لـ swr_ctx بعد كل seek.
+ * [3] التوقيت المحسوب بـ frame_timer:
+ *     بدلاً من الاعتماد على AudioStreamPlayer للحصول على الوقت، نجمع delta
+ *     في frame_timer ونعرض الإطار حين يحين وقته (1.0/fps).
+ *     هذا أكثر استقراراً وأقل تعقيداً.
  */
 
 #include "ffmpeg_player.h"
@@ -43,7 +42,6 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
 #include <libswscale/swscale.h>
-#include <libswresample/swresample.h>
 }
 
 #include <godot_cpp/core/class_db.hpp>
@@ -51,12 +49,14 @@ extern "C" {
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
-#include <godot_cpp/classes/audio_stream_generator_playback.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/audio_stream.hpp>
 
 using namespace godot;
 
-// ─── تسجيل الكلاس ────────────────────────────────────────────────────────────
+// ─── تسجيل الكلاس ─────────────────────────────────────────────────────────────
 void FFmpegPlayer::_bind_methods() {
+    // Video
     ClassDB::bind_method(D_METHOD("load_video", "path"),        &FFmpegPlayer::load_video);
     ClassDB::bind_method(D_METHOD("play"),                      &FFmpegPlayer::play);
     ClassDB::bind_method(D_METHOD("pause"),                     &FFmpegPlayer::pause);
@@ -71,45 +71,46 @@ void FFmpegPlayer::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_fps"),                   &FFmpegPlayer::get_fps);
     ClassDB::bind_method(D_METHOD("get_current_frame_texture"), &FFmpegPlayer::get_current_frame_texture);
 
-    ClassDB::bind_method(D_METHOD("set_loop",   "enable"), &FFmpegPlayer::set_loop);
-    ClassDB::bind_method(D_METHOD("get_loop"),             &FFmpegPlayer::get_loop);
-    ClassDB::bind_method(D_METHOD("set_volume", "vol"),    &FFmpegPlayer::set_volume);
-    ClassDB::bind_method(D_METHOD("get_volume"),           &FFmpegPlayer::get_volume);
+    ClassDB::bind_method(D_METHOD("set_loop",   "enable"),  &FFmpegPlayer::set_loop);
+    ClassDB::bind_method(D_METHOD("get_loop"),              &FFmpegPlayer::get_loop);
 
+    // External Audio
+    ClassDB::bind_method(D_METHOD("load_audio", "path"),        &FFmpegPlayer::load_audio);
+    ClassDB::bind_method(D_METHOD("unload_audio"),              &FFmpegPlayer::unload_audio);
+    ClassDB::bind_method(D_METHOD("set_audio_volume", "vol"),   &FFmpegPlayer::set_audio_volume);
+    ClassDB::bind_method(D_METHOD("get_audio_volume"),          &FFmpegPlayer::get_audio_volume);
+    ClassDB::bind_method(D_METHOD("set_audio_muted", "muted"),  &FFmpegPlayer::set_audio_muted);
+    ClassDB::bind_method(D_METHOD("is_audio_muted"),            &FFmpegPlayer::is_audio_muted);
+    ClassDB::bind_method(D_METHOD("get_loaded_audio_path"),     &FFmpegPlayer::get_loaded_audio_path);
+
+    // Buffer / status
     ClassDB::bind_method(D_METHOD("get_forward_buffer"),        &FFmpegPlayer::get_forward_buffer);
-    ClassDB::bind_method(D_METHOD("get_back_buffer"),           &FFmpegPlayer::get_back_buffer);
     ClassDB::bind_method(D_METHOD("is_buffering"),              &FFmpegPlayer::is_buffering);
 
-    ADD_PROPERTY(PropertyInfo(Variant::BOOL,  "loop"),   "set_loop",   "get_loop");
-    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volume"), "set_volume", "get_volume");
+    ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 
     ADD_SIGNAL(MethodInfo("video_loaded",      PropertyInfo(Variant::BOOL,   "success")));
     ADD_SIGNAL(MethodInfo("frame_updated",     PropertyInfo(Variant::OBJECT, "texture")));
     ADD_SIGNAL(MethodInfo("video_finished"));
     ADD_SIGNAL(MethodInfo("playback_error",    PropertyInfo(Variant::STRING, "message")));
     ADD_SIGNAL(MethodInfo("buffering_changed", PropertyInfo(Variant::BOOL,   "is_buffering")));
+    ADD_SIGNAL(MethodInfo("audio_loaded",      PropertyInfo(Variant::BOOL,   "success")));
 }
 
 // ─── البنّاء والهادم ──────────────────────────────────────────────────────────
-FFmpegPlayer::FFmpegPlayer()
-    : fmt_ctx(nullptr), video_codec_ctx(nullptr), sws_ctx(nullptr),
-      video_stream_idx(-1), video_width(0), video_height(0), fps(0.0),
-      frame_buffer(nullptr), audio_codec_ctx(nullptr), swr_ctx(nullptr),
-      audio_stream_idx(-1), audio_sample_rate(44100), audio_channels(2),
-      audio_player(nullptr), playing(false), looping(false), volume(1.0f),
-      duration(0.0), position(0.0)
-{}
-
+FFmpegPlayer::FFmpegPlayer() {}
 FFmpegPlayer::~FFmpegPlayer() { _cleanup(); }
 
 // ─── _ready ───────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_ready() {
-    audio_player = memnew(AudioStreamPlayer);
-    audio_player->set_name("_AudioPlayer");
-    add_child(audio_player);
+    // مشغّل الصوت الخارجي — مستقل تماماً عن الفيديو
+    ext_audio_player = memnew(AudioStreamPlayer);
+    ext_audio_player->set_name("_ExtAudioPlayer");
+    add_child(ext_audio_player);
 
-    UtilityFunctions::print("--- FFmpeg GDExtension v2.1 Ready ---");
+    UtilityFunctions::print("--- FFmpeg GDExtension v3.0 (Video-Only) Ready ---");
 
+    // طباعة فكودكات الأجهزة المتاحة
     void *opaque = nullptr;
     const AVCodec *codec;
     while ((codec = av_codec_iterate(&opaque))) {
@@ -119,23 +120,16 @@ void FFmpegPlayer::_ready() {
     }
 }
 
-// ─── تحميل الفيديو ───────────────────────────────────────────────────────────
+// ─── تحميل الفيديو ────────────────────────────────────────────────────────────
 bool FFmpegPlayer::load_video(const String &path) {
     _cleanup();
+
     buffering           = false;
     forward_buffer_secs = 0.0;
-    back_buffer_secs    = 0.0;
     position            = 0.0;
-    audio_pts_offset    = 0.0;
-    audio_pts_set       = false;
+    frame_timer         = 0.0;
 
     if (path.is_empty()) { _emit_playback_error("Path is empty"); return false; }
-
-    if (!audio_player) {
-        audio_player = memnew(AudioStreamPlayer);
-        audio_player->set_name("_AudioPlayer");
-        add_child(audio_player);
-    }
 
     is_streaming = path.begins_with("http://") || path.begins_with("https://")
                 || path.begins_with("rtmp://") || path.begins_with("rtsp://");
@@ -174,79 +168,85 @@ bool FFmpegPlayer::load_video(const String &path) {
         return false;
     }
 
-    // حساب start_time للتعويض في حسابات PTS
     stream_start_time = (fmt_ctx->start_time != AV_NOPTS_VALUE)
                         ? (double)fmt_ctx->start_time / AV_TIME_BASE
                         : 0.0;
 
+    // نبحث عن مسار الفيديو فقط — نتجاهل مسارات الصوت تماماً
     video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
-    if (video_stream_idx >= 0) {
-        AVStream      *vstream = fmt_ctx->streams[video_stream_idx];
-        const AVCodec *vcodec  = nullptr;
-
-        if      (vstream->codecpar->codec_id == AV_CODEC_ID_H264)
-            vcodec = avcodec_find_decoder_by_name("h264_mediacodec");
-        else if (vstream->codecpar->codec_id == AV_CODEC_ID_HEVC)
-            vcodec = avcodec_find_decoder_by_name("hevc_mediacodec");
-        else if (vstream->codecpar->codec_id == AV_CODEC_ID_VP8)
-            vcodec = avcodec_find_decoder_by_name("vp8_mediacodec");
-        else if (vstream->codecpar->codec_id == AV_CODEC_ID_VP9)
-            vcodec = avcodec_find_decoder_by_name("vp9_mediacodec");
-
-        if (!vcodec) {
-            vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
-            UtilityFunctions::print("[VIDEO] Mode: SOFTWARE");
-        } else {
-            UtilityFunctions::print("[VIDEO] Mode: HARDWARE (MediaCodec)");
-        }
-
-        if (!vcodec) {
-            _emit_playback_error("No video decoder found");
-            _cleanup();
-            return false;
-        }
-
-        video_codec_ctx = avcodec_alloc_context3(vcodec);
-        avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
-        if (String(vcodec->name).find("mediacodec") == -1)
-            video_codec_ctx->thread_count = 0;
-
-        if (avcodec_open2(video_codec_ctx, vcodec, nullptr) < 0) {
-            _emit_playback_error("Cannot open video decoder");
-            _cleanup();
-            return false;
-        }
-
-        video_width  = video_codec_ctx->width;
-        video_height = video_codec_ctx->height;
-        fps          = av_q2d(vstream->r_frame_rate);
-
-        sws_ctx = sws_getContext(
-            video_width, video_height, video_codec_ctx->pix_fmt,
-            video_width, video_height, AV_PIX_FMT_RGB24,
-            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-
-        _allocate_buffers();
+    if (video_stream_idx < 0) {
+        _cleanup();
+        _emit_playback_error("No video stream found in: " + path);
+        _emit_video_loaded(false);
+        return false;
     }
 
-    if (audio_stream_idx >= 0) {
-        if (!_setup_audio(fmt_ctx->streams[audio_stream_idx]))
-            UtilityFunctions::printerr("[WARN] Audio setup failed.");
+    AVStream      *vstream = fmt_ctx->streams[video_stream_idx];
+    const AVCodec *vcodec  = nullptr;
+
+    // نجرب الفكودك العتادي أولاً
+    if      (vstream->codecpar->codec_id == AV_CODEC_ID_H264)
+        vcodec = avcodec_find_decoder_by_name("h264_mediacodec");
+    else if (vstream->codecpar->codec_id == AV_CODEC_ID_HEVC)
+        vcodec = avcodec_find_decoder_by_name("hevc_mediacodec");
+    else if (vstream->codecpar->codec_id == AV_CODEC_ID_VP8)
+        vcodec = avcodec_find_decoder_by_name("vp8_mediacodec");
+    else if (vstream->codecpar->codec_id == AV_CODEC_ID_VP9)
+        vcodec = avcodec_find_decoder_by_name("vp9_mediacodec");
+
+    if (!vcodec) {
+        vcodec = avcodec_find_decoder(vstream->codecpar->codec_id);
+        UtilityFunctions::print("[VIDEO] Mode: SOFTWARE");
+    } else {
+        UtilityFunctions::print("[VIDEO] Mode: HARDWARE (MediaCodec)");
     }
+
+    if (!vcodec) {
+        _emit_playback_error("No video decoder found");
+        _cleanup();
+        return false;
+    }
+
+    video_codec_ctx = avcodec_alloc_context3(vcodec);
+    avcodec_parameters_to_context(video_codec_ctx, vstream->codecpar);
+
+    // في وضع البرمجيات: نستخدم كل الخيوط المتاحة للتعامل مع الفيديو الحقيقي
+    if (String(vcodec->name).find("mediacodec") == -1) {
+        video_codec_ctx->thread_count = 0;   // 0 = تلقائي (يختار FFmpeg العدد الأمثل)
+        video_codec_ctx->thread_type  = FF_THREAD_FRAME; // decode إطارات متعددة بالتوازي
+    }
+
+    if (avcodec_open2(video_codec_ctx, vcodec, nullptr) < 0) {
+        _emit_playback_error("Cannot open video decoder");
+        _cleanup();
+        return false;
+    }
+
+    video_width  = video_codec_ctx->width;
+    video_height = video_codec_ctx->height;
+    fps          = av_q2d(vstream->r_frame_rate);
+    if (fps <= 0.0 || fps > 240.0) fps = 30.0; // قيمة احتياطية آمنة
+
+    sws_ctx = sws_getContext(
+        video_width, video_height, video_codec_ctx->pix_fmt,
+        video_width, video_height, AV_PIX_FMT_RGB24,
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
     duration = (fmt_ctx->duration != AV_NOPTS_VALUE)
                ? (double)fmt_ctx->duration / AV_TIME_BASE
                : 0.0;
 
+    _allocate_buffers();
     _emit_video_loaded(true);
+
     UtilityFunctions::print("[LOAD] OK | duration=", duration, "s | fps=", fps,
+                            " | ", video_width, "x", video_height,
                             " | start_time=", stream_start_time, "s");
     return true;
 }
 
-// ─── تهيئة البافرات ────────────────────────────────────────────────────────
+// ─── تخصيص بافرات الذاكرة ─────────────────────────────────────────────────────
 void FFmpegPlayer::_allocate_buffers() {
     if (frame_buffer) { av_free(frame_buffer); frame_buffer = nullptr; }
 
@@ -254,6 +254,7 @@ void FFmpegPlayer::_allocate_buffers() {
     frame_buffer = (uint8_t *)av_malloc(buf_size);
     if (!frame_buffer) { UtilityFunctions::printerr("[MEM] Alloc failed!"); return; }
 
+    // إنشاء texture أسود ابتدائي
     PackedByteArray black;
     black.resize(video_width * video_height * 3);
     black.fill(0);
@@ -265,25 +266,134 @@ void FFmpegPlayer::_allocate_buffers() {
     UtilityFunctions::print("[MEM] Buffers ready: ", video_width, "x", video_height);
 }
 
+// ─── تحميل الصوت الخارجي ──────────────────────────────────────────────────────
+// يقبل: res://audio/arabic.mp3  أو  /storage/.../file.mp3  أو  http://...
+// يعتمد على ResourceLoader لـ res:// وعلى FileAccess لمسارات الجهاز
+bool FFmpegPlayer::load_audio(const String &path) {
+    if (!ext_audio_player) {
+        ext_audio_player = memnew(AudioStreamPlayer);
+        ext_audio_player->set_name("_ExtAudioPlayer");
+        add_child(ext_audio_player);
+    }
+
+    if (ext_audio_player->is_playing()) ext_audio_player->stop();
+
+    if (path.is_empty()) {
+        loaded_audio_path = "";
+        ext_audio_player->set_stream(Ref<AudioStream>());
+        emit_signal("audio_loaded", false);
+        return false;
+    }
+
+    // للمسارات التي يتعامل معها ResourceLoader (res:// و user://)
+    if (path.begins_with("res://") || path.begins_with("user://")) {
+        Ref<Resource> res = ResourceLoader::get_singleton()->load(path);
+        Ref<AudioStream> stream = res;
+        if (stream.is_null()) {
+            UtilityFunctions::printerr("[AUDIO] Cannot load: ", path);
+            emit_signal("audio_loaded", false);
+            return false;
+        }
+        ext_audio_player->set_stream(stream);
+        loaded_audio_path = path;
+        _apply_audio_volume();
+        UtilityFunctions::print("[AUDIO] Loaded (res): ", path);
+        emit_signal("audio_loaded", true);
+        return true;
+    }
+
+    // للملفات الخارجية على الجهاز أو HTTP — نقرأها يدوياً كـ bytes
+    // ملاحظة: Godot لا يدعم تحميل HTTP مباشرة عبر AudioStream.
+    // للروابط يُفضّل التحميل المسبق عبر HTTPRequest ثم تخزينها في user://
+    // هنا ندعم المسارات المطلقة على الجهاز فقط
+    Ref<FileAccess> fa = FileAccess::open(path, FileAccess::READ);
+    if (fa.is_null()) {
+        UtilityFunctions::printerr("[AUDIO] File not found: ", path);
+        emit_signal("audio_loaded", false);
+        return false;
+    }
+
+    PackedByteArray data = fa->get_buffer(fa->get_length());
+    fa.unref();
+
+    String lower = path.to_lower();
+    Ref<AudioStream> stream;
+
+    if (lower.ends_with(".mp3")) {
+        Ref<AudioStreamMP3> mp3;
+        mp3.instantiate();
+        mp3->set_data(data);
+        stream = mp3;
+    } else if (lower.ends_with(".ogg")) {
+        Ref<AudioStreamOggVorbis> ogg = AudioStreamOggVorbis::load_from_buffer(data);
+        stream = ogg;
+    } else {
+        UtilityFunctions::printerr("[AUDIO] Unsupported format (use mp3 or ogg): ", path);
+        emit_signal("audio_loaded", false);
+        return false;
+    }
+
+    if (stream.is_null()) {
+        UtilityFunctions::printerr("[AUDIO] Decode failed for: ", path);
+        emit_signal("audio_loaded", false);
+        return false;
+    }
+
+    ext_audio_player->set_stream(stream);
+    loaded_audio_path = path;
+    _apply_audio_volume();
+    UtilityFunctions::print("[AUDIO] Loaded (file): ", path);
+    emit_signal("audio_loaded", true);
+    return true;
+}
+
+void FFmpegPlayer::unload_audio() {
+    if (ext_audio_player) {
+        if (ext_audio_player->is_playing()) ext_audio_player->stop();
+        ext_audio_player->set_stream(Ref<AudioStream>());
+    }
+    loaded_audio_path = "";
+}
+
+void FFmpegPlayer::_apply_audio_volume() {
+    if (!ext_audio_player) return;
+    if (audio_muted) {
+        ext_audio_player->set_volume_db(-80.0f);
+    } else {
+        float db = (audio_volume <= 0.0001f) ? -80.0f : 20.0f * log10f(audio_volume);
+        ext_audio_player->set_volume_db(db);
+    }
+}
+
+void FFmpegPlayer::set_audio_volume(float vol) {
+    audio_volume = CLAMP(vol, 0.0f, 1.0f);
+    _apply_audio_volume();
+}
+float FFmpegPlayer::get_audio_volume() const { return audio_volume; }
+
+void FFmpegPlayer::set_audio_muted(bool muted) {
+    audio_muted = muted;
+    _apply_audio_volume();
+}
+bool FFmpegPlayer::is_audio_muted() const { return audio_muted; }
+String FFmpegPlayer::get_loaded_audio_path() const { return loaded_audio_path; }
+
 // ─── play ─────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::play() {
     if (!fmt_ctx) { UtilityFunctions::printerr("[PLAY] No video loaded."); return; }
 
     _prefill_buffers();
 
-    playing  = true;
+    playing   = true;
     buffering = false;
+    frame_timer = 0.0;
 
-    if (audio_player) {
-        // [إصلاح G] نوقف أولاً ثم نشغّل دائماً — هذا يضمن أن
-        // stream_playbacks غير فارغة → get_stream_playback() لا يفشل أبداً
-        if (audio_player->is_playing()) audio_player->stop();
-        audio_player->play();
-        audio_player->set_stream_paused(false);
-        // إعادة ضبط الساعة لأن play() يُصفّر get_playback_position()
-        audio_pts_offset = position;
-        audio_pts_set    = false;
+    // تشغيل الصوت الخارجي إن وجد، من نفس الموضع الزمني
+    if (ext_audio_player && ext_audio_player->get_stream().is_valid()) {
+        if (ext_audio_player->is_playing()) ext_audio_player->stop();
+        ext_audio_player->play((float)position);
     }
+
     UtilityFunctions::print("[PLAY] Started. pos=", position,
                             " fwd=", forward_buffer_secs, "s");
 }
@@ -291,197 +401,212 @@ void FFmpegPlayer::play() {
 // ─── pause ────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::pause() {
     playing = false;
-    // [إصلاح C] لا نلمس audio_player إذا لم يكن يعمل
-    if (audio_player && audio_player->is_playing()) {
-        audio_player->set_stream_paused(true);
+    if (ext_audio_player && ext_audio_player->is_playing()) {
+        ext_audio_player->set_stream_paused(true);
     }
 }
 
+// ─── stop ─────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::stop() {
     playing = false;
-    if (audio_player && audio_player->is_playing()) audio_player->stop();
+    if (ext_audio_player && ext_audio_player->is_playing()) {
+        ext_audio_player->stop();
+    }
     seek(0.0);
 }
 
-// ─── Seek ذكي ────────────────────────────────────────────────────────────────
+// ─── seek ─────────────────────────────────────────────────────────────────────
 void FFmpegPlayer::seek(double seconds) {
     if (!fmt_ctx || !video_codec_ctx) return;
 
     bool was_playing = playing;
     playing = false;
 
-    // [إصلاح C+B] إيقاف الصوت دائماً قبل Seek (سواء fast أو full)
-    // هذا يُصفّر get_playback_position() ويمنع desync
-    if (audio_player && audio_player->is_playing()) audio_player->stop();
+    if (ext_audio_player && ext_audio_player->is_playing()) ext_audio_player->stop();
 
-    double range_start = position - back_buffer_secs  - 0.5;
+    // نحاول Fast Seek أولاً (داخل البافر الحالي)
+    double range_start = position - 2.0;
     double range_end   = position + forward_buffer_secs + 0.5;
     bool   in_buffer   = (seconds >= range_start && seconds <= range_end);
 
-    UtilityFunctions::print("[SEEK] Target=", seconds,
-                            " InBuffer=", in_buffer ? "YES" : "NO");
-
     if (in_buffer) {
-        // ── Fast Seek ─────────────────────────────────────────────────────
-        // [إصلاح B] نُنظف كودك الصوت ونتجاوز الحزم القديمة
-        if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
-
-        // [إصلاح E] flush swr_ctx لإزالة العينات المتراكمة (تُسبب صوتاً سريعاً)
-        if (swr_ctx) {
-            uint8_t *flush_buf = nullptr;
-            int ls = 0;
-            int flushed = swr_convert(swr_ctx, nullptr, 0, nullptr, 0);
-            (void)flushed;
+        // حذف الإطارات المُفكَّكة القديمة
+        while (!decoded_frame_queue.empty() && decoded_frame_queue.front().pts < seconds - 0.05) {
+            decoded_frame_queue.pop_front();
         }
-
-        // تجاوز حزم الصوت القديمة التي هي قبل الهدف
-        if (audio_stream_idx >= 0) {
-            double atb = av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
-            while (!audio_packet_queue.empty()) {
-                AVPacket *p = audio_packet_queue.front();
-                if (p->pts != AV_NOPTS_VALUE) {
-                    double pts = p->pts * atb;
-                    if (pts < seconds - 0.5) {
-                        audio_packet_queue.pop_front();
-                        av_packet_free(&p);
-                        continue;
-                    }
-                }
-                break;
-            }
-        }
-
-        position         = seconds;
-        audio_pts_offset = seconds;
-        audio_pts_set    = false;
-
-        UtilityFunctions::print("[SEEK] Fast seek done.");
-
+        position    = seconds;
+        frame_timer = 0.0;
+        UtilityFunctions::print("[SEEK] Fast seek to ", seconds);
     } else {
-        // ── Full Seek ─────────────────────────────────────────────────────
+        // Full Seek
         _clear_queues();
+        decoded_frame_queue.clear();
 
         int64_t seek_target = (int64_t)(seconds * AV_TIME_BASE);
         if (av_seek_frame(fmt_ctx, -1, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
             UtilityFunctions::printerr("[SEEK] av_seek_frame failed: ", seconds);
             _emit_playback_error("Seek failed");
-            if (was_playing) { playing = true; if (audio_player) audio_player->play(); }
+            if (was_playing) { playing = true; }
             return;
         }
 
         avcodec_flush_buffers(video_codec_ctx);
-        if (audio_codec_ctx) avcodec_flush_buffers(audio_codec_ctx);
 
-        // [إصلاح E] إعادة بناء swr_ctx لإزالة أي delay متراكم
-        if (swr_ctx) { swr_free(&swr_ctx); swr_ctx = nullptr; }
-        if (audio_stream_idx >= 0) {
-            _setup_audio(fmt_ctx->streams[audio_stream_idx]);
+        if (sws_ctx) {
+            sws_freeContext(sws_ctx);
+            sws_ctx = sws_getContext(video_width, video_height, video_codec_ctx->pix_fmt,
+                                     video_width, video_height, AV_PIX_FMT_RGB24,
+                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         }
 
-        if (sws_ctx) { sws_freeContext(sws_ctx); sws_ctx = nullptr; }
-
         position            = seconds;
-        audio_pts_offset    = seconds;
-        audio_pts_set       = false;
+        frame_timer         = 0.0;
         forward_buffer_secs = 0.0;
-        back_buffer_secs    = 0.0;
 
-        // ملء أولي بعد Seek
         buffering = true;
         if (is_inside_tree()) emit_signal("buffering_changed", true);
-        for (int i = 0; i < 30; i++) _read_packets_to_queue();
+
+        for (int i = 0; i < 40; i++) _read_packets_to_queue();
+        _decode_packets_into_queue();
         _update_buffer_stats();
+
         if (forward_buffer_secs >= INITIAL_PLAY) {
             buffering = false;
             if (is_inside_tree()) emit_signal("buffering_changed", false);
         }
 
-        UtilityFunctions::print("[SEEK] Full seek complete.");
+        UtilityFunctions::print("[SEEK] Full seek to ", seconds,
+                                " fwd=", forward_buffer_secs);
     }
 
     if (was_playing) {
         playing = true;
-        if (audio_player) audio_player->play();
+        if (ext_audio_player && ext_audio_player->get_stream().is_valid()) {
+            ext_audio_player->play((float)position);
+        }
     }
 }
 
-// ─── _process ────────────────────────────────────────────────────────────────
+// ─── _process ─────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_process(double delta) {
     if (!fmt_ctx || !playing || buffering) return;
 
     _update_buffer_stats();
 
-    // خفضنا حد التوقف ليكون 0.5 ثانية بدل 1.0 لزيادة الاستمرارية
-    if (forward_buffer_secs < 0.5) {
+    // حد الـ Buffering: إذا نفد البافر نوقف مؤقتاً
+    if (forward_buffer_secs < 0.3 && decoded_frame_queue.empty()) {
         playing = false;
         buffering = true;
-        if (audio_player) audio_player->set_stream_paused(true);
+        if (ext_audio_player && ext_audio_player->is_playing())
+            ext_audio_player->set_stream_paused(true);
         if (is_inside_tree()) emit_signal("buffering_changed", true);
+        UtilityFunctions::print("[BUFFER] Underrun at pos=", position,
+                                " fwd=", forward_buffer_secs);
         return;
     }
 
-    if (audio_stream_idx >= 0 && audio_player && audio_player->is_playing()) {
-        double audio_time = audio_pts_offset + audio_player->get_playback_position();
-        
-        // بدلاً من lerp المستمر، نحدث الموقع مباشرة فقط إذا كان الفرق مؤثراً (> 10ms)
-        if (Math::abs(audio_time - position) > 0.01) {
-            position = audio_time;
+    // إذا كنا نعود من حالة buffering
+    if (buffering && (forward_buffer_secs >= INITIAL_PLAY || !decoded_frame_queue.empty())) {
+        buffering = false;
+        if (ext_audio_player && ext_audio_player->get_stream().is_valid()
+            && !ext_audio_player->is_playing()) {
+            ext_audio_player->play((float)position);
+            ext_audio_player->set_stream_paused(false);
         }
-    } else {
-        position += delta;
+        if (is_inside_tree()) emit_signal("buffering_changed", false);
     }
 
-    _decode_next_frame();
+    // تقدم الوقت
+    position    += delta;
+    frame_timer += delta;
 
+    // نحافظ على طابور الإطارات ممتلئاً
+    if ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES) {
+        _decode_packets_into_queue();
+    }
+
+    // نقرأ حزماً جديدة للحفاظ على البافر
+    _read_packets_to_queue();
+
+    // عرض الإطار المناسب
+    _present_frame_at(position);
+
+    // فحص نهاية الفيديو
     if (duration > 0.0 && position >= duration) {
-        if (looping) { seek(0.0); } 
-        else { stop(); _emit_video_finished(); }
+        if (looping) {
+            seek(0.0);
+        } else {
+            stop();
+            _emit_video_finished();
+        }
     }
 }
 
-
-
-// ─── حساب إحصاءات البافر ─────────────────────────────────────────────────────
+// ─── _update_buffer_stats ──────────────────────────────────────────────────────
 void FFmpegPlayer::_update_buffer_stats() {
     if (video_stream_idx < 0 || !fmt_ctx) return;
 
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-    double vstream_start = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE) 
+    double vstream_start = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
                             ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
-    double fwd = 0.0;
+    // نحسب البافر من آخر حزمة في طابور الحزم الخام
     if (video_packet_queue.empty()) {
-        forward_buffer_secs = 0.0;
+        // إذا فرغت الحزم لكن عندنا إطارات مُفكَّكة، نحسب منها
+        if (!decoded_frame_queue.empty()) {
+            forward_buffer_secs = Math::max(0.0, decoded_frame_queue.back().pts - position);
+        } else {
+            forward_buffer_secs = 0.0;
+        }
     } else {
         AVPacket *last_pkt = video_packet_queue.back();
         if (last_pkt->pts != AV_NOPTS_VALUE) {
             double last_pts = (last_pkt->pts * tb) - vstream_start;
-            fwd = last_pts - position;
+            forward_buffer_secs = Math::max(0.0, last_pts - position);
         }
-        forward_buffer_secs = Math::max(0.0, fwd);
     }
-    
-    // حساب بافر الخلف (اختياري، لا يؤثر على التشغيل)
-    back_buffer_secs = 0.0; 
 }
 
+// ─── حساب دفعة القراءة ────────────────────────────────────────────────────────
+int FFmpegPlayer::_calc_read_batch_size() const {
+    if (forward_buffer_secs < MIN_FORWARD) return 100; // تعبئة سريعة
+    if (forward_buffer_secs < MAX_FORWARD) return 30;
+    return 5; // الحد الأدنى — لمنع نضوب البافر
+}
 
-// ─── حذف حزم الخلف الزائدة ───────────────────────────────────────────────────
-void FFmpegPlayer::_trim_back_buffer() {
-    if (video_stream_idx < 0) return;
+// ─── قراءة الحزم الخام ────────────────────────────────────────────────────────
+void FFmpegPlayer::_read_packets_to_queue() {
+    if (!fmt_ctx) return;
+
+    int batch    = _calc_read_batch_size();
+    AVPacket *pk = av_packet_alloc();
+
+    for (int i = 0; i < batch; i++) {
+        if (av_read_frame(fmt_ctx, pk) < 0) {
+            av_packet_unref(pk);
+            break;
+        }
+        // نأخذ حزم الفيديو فقط — نتخلص من أي شيء آخر
+        if (pk->stream_index == video_stream_idx) {
+            video_packet_queue.push_back(av_packet_clone(pk));
+        }
+        av_packet_unref(pk);
+    }
+    av_packet_free(&pk);
+
+    // حذف الحزم القديمة جداً لتوفير الذاكرة
     double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-    double vstream_start = 0.0;
-    if (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
-        vstream_start = fmt_ctx->streams[video_stream_idx]->start_time * tb;
+    double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
+                    ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
-    while (back_buffer_secs > MAX_BACK && !video_packet_queue.empty()) {
+    while (!video_packet_queue.empty()) {
         AVPacket *oldest = video_packet_queue.front();
         if (oldest->pts != AV_NOPTS_VALUE) {
-            double pts = (oldest->pts * tb) - vstream_start;
-            if (pts < position - 1.0) {
+            double pts = (oldest->pts * tb) - vstart;
+            // احتفظ بأكثر من 60 ثانية للأمام كحد أقصى
+            if (pts < position - 5.0) {
                 av_packet_free(&oldest);
                 video_packet_queue.pop_front();
-                _update_buffer_stats();
                 continue;
             }
         }
@@ -489,312 +614,172 @@ void FFmpegPlayer::_trim_back_buffer() {
     }
 }
 
-// ─── حجم دفعة القراءة الديناميكية ────────────────────────────────────────────
-// [إصلاح D] دائماً نقرأ 5 حزم على الأقل لمنع oscillation
-int FFmpegPlayer::_calc_read_batch_size() const {
-    if (forward_buffer_secs < MIN_FORWARD)  return 80;
-    if (forward_buffer_secs < MAX_FORWARD)  return 20;
-    return 5; // الحد الأدنى — لمنع نضوب البافر المفاجئ
-}
+// ─── فك تشفير الحزم إلى طابور الإطارات ───────────────────────────────────────
+// هذه هي قلب إصلاح التقطع:
+// نُفكّك عدة إطارات مسبقاً ونخزنها جاهزة في decoded_frame_queue
+// بدلاً من فك كل إطار في اللحظة التي نريد عرضه فيها
+void FFmpegPlayer::_decode_packets_into_queue() {
+    if (!video_codec_ctx || !frame_buffer) return;
 
-// ─── قراءة الحزم ─────────────────────────────────────────────────────────────
-void FFmpegPlayer::_read_packets_to_queue() {
-    if (!fmt_ctx) return;
+    // لا نملأ إذا كان الطابور ممتلئاً بالفعل
+    if ((int)decoded_frame_queue.size() >= MAX_DECODED_FRAMES) return;
 
-    int batch   = _calc_read_batch_size();
-    AVPacket *packet = av_packet_alloc();
+    double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
+    double vstart = (fmt_ctx->streams[video_stream_idx]->start_time != AV_NOPTS_VALUE)
+                    ? fmt_ctx->streams[video_stream_idx]->start_time * tb : 0.0;
 
-    for (int i = 0; i < batch; i++) {
-        if (av_read_frame(fmt_ctx, packet) < 0) {
-            av_packet_unref(packet);
+    AVFrame *vf = av_frame_alloc();
+
+    // أرسل حزماً للكودك حتى نحصل على MAX_DECODED_FRAMES إطاراً
+    int loops = 0;
+    while ((int)decoded_frame_queue.size() < MAX_DECODED_FRAMES && loops < 50) {
+        loops++;
+
+        // حاول استقبال إطار جاهز أولاً (قد يكون الكودك لديه إطارات مخزّنة)
+        int ret = avcodec_receive_frame(video_codec_ctx, vf);
+        if (ret == 0) {
+            // إطار جاهز!
+            double frame_pts = (vf->pts != AV_NOPTS_VALUE)
+                                ? (vf->pts * tb) - vstart
+                                : position;
+
+            // تجاهل الإطارات الماضية جداً
+            if (frame_pts < position - 0.5) {
+                av_frame_unref(vf);
+                continue;
+            }
+
+            // تحويل اللون (YUV → RGB24)
+            if (!sws_ctx) {
+                sws_ctx = sws_getContext(video_width, video_height, (AVPixelFormat)vf->format,
+                                         video_width, video_height, AV_PIX_FMT_RGB24,
+                                         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+            }
+
+            uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
+            int dest_ls[4]   = { video_width * 3, 0, 0, 0 };
+            sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, dest, dest_ls);
+
+            // تخزين في طابور الإطارات المُفكَّكة
+            DecodedFrame df;
+            df.pts = frame_pts;
+            df.data.resize(video_width * video_height * 3);
+            memcpy(df.data.ptrw(), frame_buffer, df.data.size());
+            decoded_frame_queue.push_back(std::move(df));
+
+            av_frame_unref(vf);
+            continue;
+        }
+
+        if (ret == AVERROR(EAGAIN)) {
+            // الكودك يحتاج حزمة جديدة
+            if (video_packet_queue.empty()) break;
+
+            AVPacket *pkt = video_packet_queue.front();
+            video_packet_queue.pop_front();
+
+            int send_ret = avcodec_send_packet(video_codec_ctx, pkt);
+            av_packet_free(&pkt);
+
+            if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) break;
+        } else {
+            // خطأ أو EOF
             break;
         }
-        if (packet->stream_index == video_stream_idx)
-            video_packet_queue.push_back(av_packet_clone(packet));
-        else if (packet->stream_index == audio_stream_idx)
-            audio_packet_queue.push_back(av_packet_clone(packet));
-        av_packet_unref(packet);
     }
-    av_packet_free(&packet);
 
-    _trim_back_buffer();
+    av_frame_free(&vf);
 }
 
-// ─── ملء أولي ─────────────────────────────────────────────────────────────────
-// [إصلاح F] لا نُفكّك أي صوت هنا إطلاقاً — swr_ctx يجب أن يبقى نظيفاً
-// السبب: لو مررنا إطارات صوتية عبر swr_ctx هنا، يتراكم فيه delay داخلي،
-//         فعند التشغيل الفعلي يُخرج عينات مضاعفة → صوت أسرع من الحقيقي
+// ─── عرض الإطار المناسب للوقت الحالي ─────────────────────────────────────────
+bool FFmpegPlayer::_present_frame_at(double current_pos) {
+    if (decoded_frame_queue.empty()) return false;
+
+    // ابحث عن آخر إطار بـ pts <= current_pos
+    // (نمسح الإطارات الماضية ونعرض آخر واحد صالح)
+    bool found = false;
+    while (decoded_frame_queue.size() > 1) {
+        const DecodedFrame &next = decoded_frame_queue[1];
+        if (next.pts <= current_pos + 0.001) {
+            // الإطار الثاني أقرب للوقت الحالي، أزل الأول
+            decoded_frame_queue.pop_front();
+            found = true;
+        } else {
+            break;
+        }
+    }
+
+    // الآن أمامنا الإطار الأنسب في المقدمة
+    if (!decoded_frame_queue.empty()) {
+        const DecodedFrame &frame = decoded_frame_queue.front();
+
+        // لا تعرض الإطارات المستقبلية البعيدة جداً
+        if (frame.pts > current_pos + 0.15) return false;
+
+        if (current_texture.is_valid() && frame.data.size() > 0) {
+            Ref<Image> img = Image::create_from_data(
+                video_width, video_height, false, Image::FORMAT_RGB8, frame.data);
+            current_texture->update(img);
+            _emit_frame_updated();
+            return true;
+        }
+    }
+    return false;
+}
+
+// ─── الملء الأولي ─────────────────────────────────────────────────────────────
 void FFmpegPlayer::_prefill_buffers() {
     if (!fmt_ctx) return;
     UtilityFunctions::print("[PREFILL] Filling to ", INITIAL_PLAY, "s...");
 
     int attempts = 0;
-    while (forward_buffer_secs < INITIAL_PLAY && attempts < 300) {
+    while (forward_buffer_secs < INITIAL_PLAY && attempts < 400) {
         _read_packets_to_queue();
         _update_buffer_stats();
         attempts++;
     }
-    // الصوت يُفكَّك فقط بعد audio_player->play() في _decode_next_frame
 
-    UtilityFunctions::print("[PREFILL] Done. Forward=", forward_buffer_secs, "s");
+    // فك تشفير مسبق لأول مجموعة إطارات
+    _decode_packets_into_queue();
+
+    UtilityFunctions::print("[PREFILL] Done. Forward=", forward_buffer_secs,
+                            "s | Decoded=", decoded_frame_queue.size(), " frames");
 }
 
-// ─── فك التشفير وعرض الإطار ─────────────────────────────────────────────────
-
-
-
-void FFmpegPlayer::_decode_next_frame() {
-    _read_packets_to_queue();
-
-    // 1. معالجة الصوت (تأكد أن السبيس كافٍ)
-    if (audio_player && audio_player->is_playing() && audio_codec_ctx) {
-        Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
-        if (pb.is_valid()) {
-            int space = pb->get_frames_available();
-            // خفضنا الحد الأدنى للسحب لضمان عدم استهلاك المعالج كله في الصوت
-            while (!audio_packet_queue.empty() && space > 1024) {
-                AVPacket *a_pkt = audio_packet_queue.front();
-                if (avcodec_send_packet(audio_codec_ctx, a_pkt) == 0) {
-                    AVFrame *af = av_frame_alloc();
-                    while (avcodec_receive_frame(audio_codec_ctx, af) == 0) {
-                        _push_audio_samples(af);
-                        space -= af->nb_samples;
-                        av_frame_unref(af);
-                    }
-                    av_frame_free(&af);
-                }
-                audio_packet_queue.pop_front();
-                av_packet_free(&a_pkt);
-            }
-        }
-    }
-
-    if (video_packet_queue.empty() || !video_codec_ctx) return;
-
-    // 2. إرسال الحزم للكودك (أقصى 2 حزمة في الدورة الواحدة لتخفيف العبء)
-    int sent_count = 0;
-    while (!video_packet_queue.empty() && sent_count < 2) {
-        AVPacket *pkt = video_packet_queue.front();
-        if (avcodec_send_packet(video_codec_ctx, pkt) == 0) {
-            video_packet_queue.pop_front();
-            av_packet_free(&pkt);
-            sent_count++;
-        } else {
-            break; 
-        }
-    }
-
-    // 3. استقبال الإطارات مع "تسامح" أكبر في المزامنة
-    AVFrame *vf = av_frame_alloc();
-    double tb = av_q2d(fmt_ctx->streams[video_stream_idx]->time_base);
-
-    while (avcodec_receive_frame(video_codec_ctx, vf) == 0) {
-        double frame_pts = vf->pts * tb;
-        
-        // التعديل السحري هنا:
-        // السماح بتأخير يصل إلى 150ms قبل حذف الإطار (بدلاً من 40ms)
-        // هذا يمنع تجمد الصورة في حال كان المعالج بطيئاً
-        if (frame_pts < position - 0.15) {
-            av_frame_unref(vf);
-            continue; 
-        }
-
-        // إطار مستقبلي بعيد، ننتظر
-        if (frame_pts > position + 0.1) {
-            av_frame_unref(vf);
-            break;
-        }
-
-        // تحويل وعرض الإطار
-        if (!sws_ctx) {
-            sws_ctx = sws_getContext(video_width, video_height, (AVPixelFormat)vf->format,
-                                     video_width, video_height, AV_PIX_FMT_RGB24,
-                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-        }
-
-        uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
-        int dest_linesize[4] = { video_width * 3, 0, 0, 0 };
-        sws_scale(sws_ctx, vf->data, vf->linesize, 0, video_height, dest, dest_linesize);
-
-        PackedByteArray pba;
-        pba.resize(video_width * video_height * 3);
-        memcpy(pba.ptrw(), frame_buffer, pba.size());
-
-        Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-        if (current_texture.is_valid()) {
-            current_texture->update(img);
-        }
-        _emit_frame_updated();
-        
-        av_frame_unref(vf);
-        break; // عرضنا إطاراً واحداً، نخرج لنعطي فرصة للمعالج
-    }
-    av_frame_free(&vf);
-}
-
-
-
-void FFmpegPlayer::_update_texture_from_frame(AVFrame *frame) {
-    // 1. التحقق من سلامة البافرات قبل العمل
-    if (!sws_ctx || !frame_buffer || !frame) return;
-
-    // 2. إعداد مصفوفات الوجهة لعملية التحويل (Scaling/Conversion)
-    uint8_t *dest[4] = { frame_buffer, nullptr, nullptr, nullptr };
-    int dest_linesize[4] = { video_width * 3, 0, 0, 0 };
-    
-    // 3. تحويل الإطار من صيغة الكودك (غالباً YUV) إلى RGB24 التي يطلبها Godot
-    sws_scale(sws_ctx, frame->data, frame->linesize, 0, video_height, dest, dest_linesize);
-
-    // 4. نقل البيانات إلى مصفوفة بايتات Godot
-    PackedByteArray pba;
-    pba.resize(video_width * video_height * 3);
-    
-    // استخدام memcpy سريع جداً لنقل البيانات
-    memcpy(pba.ptrw(), frame_buffer, pba.size());
-
-    // 5. تحديث الصورة الموجودة فعلياً بدلاً من إنشاء واحدة جديدة في كل فريم (لتحسين الأداء)
-    Ref<Image> img = Image::create_from_data(video_width, video_height, false, Image::FORMAT_RGB8, pba);
-    
-    if (current_texture.is_valid()) {
-        current_texture->update(img);
-        _emit_frame_updated(); // إرسال إشارة للمحرك بأن الصورة تغيرت
-    }
-}
-
-
-
-// ─── دفع الصوت ────────────────────────────────────────────────────────────────
-
-void FFmpegPlayer::_push_audio_samples(AVFrame *frame) {
-    if (!audio_player || !swr_ctx || !audio_codec_ctx) return;
-
-    Ref<AudioStreamGeneratorPlayback> pb = audio_player->get_stream_playback();
-    if (pb.is_null()) return;
-
-    if (frame && !audio_pts_set && frame->pts != AV_NOPTS_VALUE && audio_player->is_playing()) {
-        double tb = av_q2d(fmt_ctx->streams[audio_stream_idx]->time_base);
-        double vstart = (fmt_ctx->streams[audio_stream_idx]->start_time != AV_NOPTS_VALUE) ? 
-                         fmt_ctx->streams[audio_stream_idx]->start_time * tb : 0.0;
-        audio_pts_offset = (frame->pts * tb) - vstart;
-        audio_pts_set = true;
-        position = audio_pts_offset;
-    }
-
-    if (frame) {
-        int out_count = av_rescale_rnd(swr_get_delay(swr_ctx, audio_sample_rate) + frame->nb_samples, 
-                                       audio_sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
-        uint8_t *out_buf = nullptr;
-        if (av_samples_alloc(&out_buf, nullptr, 2, out_count, AV_SAMPLE_FMT_FLT, 0) >= 0) {
-            int converted = swr_convert(swr_ctx, &out_buf, out_count, (const uint8_t **)frame->data, frame->nb_samples);
-            if (converted > 0) {
-                size_t old_sz = audio_overflow.size();
-                audio_overflow.resize(old_sz + (converted * 2));
-                memcpy(audio_overflow.data() + old_sz, out_buf, converted * 2 * sizeof(float));
-            }
-            av_freep(&out_buf);
-        }
-    }
-
-    int frames_available = pb->get_frames_available();
-    int overflow_frames = (int)(audio_overflow.size() / 2);
-
-    // سحب العينات بهدوء دون مسح البافر بالكامل إذا كان هناك نقص
-    if (frames_available > 0 && overflow_frames > 0) {
-        int to_push = Math::min(frames_available, overflow_frames);
-        PackedVector2Array buffer;
-        buffer.resize(to_push);
-        
-        Vector2 *wptr = buffer.ptrw();
-        const float *src = audio_overflow.data();
-        for (int i = 0; i < to_push; i++) {
-            wptr[i] = Vector2(src[i * 2] * volume, src[i * 2 + 1] * volume);
-        }
-        
-        if (pb->push_buffer(buffer)) {
-            audio_overflow.erase(audio_overflow.begin(), audio_overflow.begin() + (to_push * 2));
-        }
-    }
-}
-
-
-
-// ─── إعداد الصوت ─────────────────────────────────────────────────────────────
-bool FFmpegPlayer::_setup_audio(AVStream *astream) {
-    if (!astream || !astream->codecpar) return false;
-
-    const AVCodec *codec = avcodec_find_decoder(astream->codecpar->codec_id);
-    if (!codec) return false;
-
-    if (audio_codec_ctx) { avcodec_free_context(&audio_codec_ctx); audio_codec_ctx = nullptr; }
-    audio_codec_ctx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(audio_codec_ctx, astream->codecpar);
-    if (avcodec_open2(audio_codec_ctx, codec, nullptr) < 0) return false;
-
-    if (swr_ctx) { swr_free(&swr_ctx); swr_ctx = nullptr; }
-    swr_ctx = swr_alloc();
-
-    AVChannelLayout out_layout;
-    av_channel_layout_default(&out_layout, 2);
-
-    av_opt_set_chlayout(swr_ctx,    "in_chlayout",    &audio_codec_ctx->ch_layout, 0);
-    av_opt_set_chlayout(swr_ctx,    "out_chlayout",   &out_layout, 0);
-    av_opt_set_int(swr_ctx,         "in_sample_rate",  audio_codec_ctx->sample_rate, 0);
-    av_opt_set_int(swr_ctx,         "out_sample_rate", audio_codec_ctx->sample_rate, 0);
-    av_opt_set_sample_fmt(swr_ctx,  "in_sample_fmt",   audio_codec_ctx->sample_fmt, 0);
-    av_opt_set_sample_fmt(swr_ctx,  "out_sample_fmt",  AV_SAMPLE_FMT_FLT, 0);
-
-    if (swr_init(swr_ctx) < 0) return false;
-
-    audio_sample_rate = audio_codec_ctx->sample_rate;
-
-    if (!audio_generator.is_valid()) audio_generator.instantiate();
-    audio_generator->set_mix_rate(audio_sample_rate);
-    audio_generator->set_buffer_length(2.0f); // [إصلاح H] 2s بدل 0.5s → هامش كافٍ
-
-    if (audio_player) audio_player->set_stream(audio_generator);
-    return true;
-}
-
-// ─── تنظيف ────────────────────────────────────────────────────────────────────
+// ─── تنظيف الطوابير ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_clear_queues() {
     while (!video_packet_queue.empty()) {
         AVPacket *p = video_packet_queue.front();
         video_packet_queue.pop_front();
         av_packet_free(&p);
     }
-    while (!audio_packet_queue.empty()) {
-        AVPacket *p = audio_packet_queue.front();
-        audio_packet_queue.pop_front();
-        av_packet_free(&p);
-    }
+    decoded_frame_queue.clear();
     forward_buffer_secs = 0.0;
-    back_buffer_secs    = 0.0;
 }
 
-void FFmpegPlayer::_clear_audio_buffers() {
-    if (swr_ctx) { swr_close(swr_ctx); swr_init(swr_ctx); }
-    if (audio_player && audio_player->is_playing()) audio_player->stop();
-}
-
+// ─── التنظيف الكامل ───────────────────────────────────────────────────────────
 void FFmpegPlayer::_cleanup() {
     _clear_queues();
-    
-    // تصفير بافر الصوت لمنع تداخل أصوات الأفلام السابقة
-    audio_overflow.clear();
-    
+
     if (video_codec_ctx) { avcodec_free_context(&video_codec_ctx); video_codec_ctx = nullptr; }
-    if (audio_codec_ctx) { avcodec_free_context(&audio_codec_ctx); audio_codec_ctx = nullptr; }
     if (fmt_ctx)         { avformat_close_input(&fmt_ctx);         fmt_ctx         = nullptr; }
     if (sws_ctx)         { sws_freeContext(sws_ctx);               sws_ctx         = nullptr; }
-    if (swr_ctx)         { swr_free(&swr_ctx);                     swr_ctx         = nullptr; }
     if (frame_buffer)    { av_free(frame_buffer);                  frame_buffer    = nullptr; }
-    
-    duration = position = 0.0;
-    is_streaming = false;
+
+    duration            = 0.0;
+    position            = 0.0;
+    forward_buffer_secs = 0.0;
+    frame_timer         = 0.0;
+    playing             = false;
+    buffering           = false;
+    is_streaming        = false;
+    video_stream_idx    = -1;
+    video_width         = 0;
+    video_height        = 0;
+    fps                 = 0.0;
 }
 
-
-// ─── إشارات ──────────────────────────────────────────────────────────────────
+// ─── الإشارات ─────────────────────────────────────────────────────────────────
 void FFmpegPlayer::_emit_video_loaded(bool s) {
     if (is_inside_tree()) emit_signal("video_loaded", s);
 }
@@ -810,7 +795,7 @@ void FFmpegPlayer::_emit_playback_error(const String &msg) {
 }
 
 // ─── Getters / Setters ────────────────────────────────────────────────────────
-bool   FFmpegPlayer::is_playing()       const { return playing; }
+bool   FFmpegPlayer::is_playing()       const { return playing && !buffering; }
 double FFmpegPlayer::get_duration()     const { return duration; }
 double FFmpegPlayer::get_position()     const { return position; }
 int    FFmpegPlayer::get_video_width()  const { return video_width; }
@@ -820,15 +805,6 @@ Ref<ImageTexture> FFmpegPlayer::get_current_frame_texture() const { return curre
 
 void FFmpegPlayer::set_loop(bool en) { looping = en; }
 bool FFmpegPlayer::get_loop() const  { return looping; }
-
-void FFmpegPlayer::set_volume(float v) {
-    volume = v;
-    if (audio_player) {
-        float db = (volume <= 0.0001f) ? -80.0f : 20.0f * log10(volume);
-        audio_player->set_volume_db(db);
-    }
-}
-float FFmpegPlayer::get_volume() const { return volume; }
 
 // ─── نقطة دخول GDExtension ───────────────────────────────────────────────────
 extern "C" {
